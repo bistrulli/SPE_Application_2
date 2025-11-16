@@ -1,0 +1,91 @@
+# Experiment Mapping Configuration
+# This file defines the mapping between Kubernetes deployment and JMT queueing model
+
+experiment:
+  name: "3tier_closed_validation"
+  description: "Validate 3-tier microservice architecture against Closed_3tier.jsimg template"
+
+# JMT Configuration
+jmt:
+  # Path to JMT template file (.jmva for analytical MVA, .jsimg for simulation)
+  template: "QNonK8s/JMT_mva_validation/Closed_3tier.jmva"
+  # Path to JMT JAR file
+  jar_path: "/Users/emilio-imt/JMT-singlejar-1.2.2.jar"
+  # Maximum simulation time in seconds (only for .jsimg simulation)
+  max_simulation_time: 120
+
+  # Solver type: "mva" for analytical solver, "sim" for simulation
+  solver_type: "mva"
+
+  # Network type: "open" or "closed"
+  network_type: "closed"
+
+  # Parameters for closed networks (ignored for open networks)
+  closed_network:
+    # Number of customers circulating in the closed network
+    # This will be calculated as: locust_users
+    customers: 1
+    # Station where customers start (delay station)
+    reference_station: "Delay 1"
+
+# Kubernetes Configuration
+kubernetes:
+  # Path to K8s deployment manifest
+  manifest: "QNonK8s/applications/3tier.yaml"
+  # Kubernetes namespace
+  namespace: "default"
+
+# Mapping between K8s deployments and JMT stations
+# This defines which K8s service corresponds to which JMT queueing station
+mapping:
+  # Delay station (think time)
+  delay:
+    jmt_station: "Delay 1"
+    station_type: "Delay"
+    update_params:
+      - think_time_lambda  # Will be set based on workload.think_time
+
+  # Task1 deployment -> Tier1 in JMT
+  task1-deployment:
+    jmt_station: "Tier1"
+    station_type: "Server"
+    service_time_env_var: "SERVICE_TIME_SECONDS"
+    update_params:
+      - service_time_lambda  # 1/service_time
+      - num_servers          # replicas from K8s
+
+  # Task2 deployment -> Tier2 in JMT
+  task2-deployment:
+    jmt_station: "Tier2"
+    station_type: "Server"
+    service_time_env_var: "SERVICE_TIME_SECONDS"
+    update_params:
+      - service_time_lambda  # 1/service_time
+      - num_servers          # replicas from K8s
+
+# Workload Configuration
+workload:
+  # For OPEN networks: arrival rate (requests per second)
+  arrival_rate: 2.0
+
+  # For CLOSED networks: think time between requests (seconds)
+  # This will be used to set lambda in the Delay station
+  # lambda = 1/think_time
+  think_time: 1.0
+
+  # Type of arrival/service distribution
+  distribution: "exponential"
+
+# Validation Settings
+validation:
+  # Acceptable relative error percentage
+  acceptable_error_threshold: 15.0
+
+  # Metrics to compare
+  metrics:
+    - throughput
+    - response_time
+    - utilization
+
+  # Generate plots for comparison
+  generate_plots: true

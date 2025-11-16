@@ -1,0 +1,28 @@
+prometheus:
+  prometheusSpec:
+    additionalScrapeConfigs:
+      # Configurazione per collezionare le metriche del control plane di Istio (istiod)
+      - job_name: 'istiod'
+        kubernetes_sd_configs:
+        - role: endpoints
+          namespaces:
+            names: ['istio-system']
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: istiod;http-monitoring
+
+      # Configurazione per collezionare le metriche dei sidecar Envoy di Istio
+      - job_name: 'istio-envoy'
+        metrics_path: /stats/prometheus
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_container_name]
+          action: keep
+          regex: istio-proxy
+        - source_labels: [__address__, __meta_kubernetes_pod_container_port_number]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:15020
+          target_label: __address__

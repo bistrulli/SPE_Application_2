@@ -1,0 +1,15 @@
+Metric,Mean,Std Dev,Min,Max,Unit
+Users,1.0000,0.0000,1.0000,1.0000,users
+Client RPS,0.9200,0.2489,0.3000,1.5000,req/s
+Client Response Time,92.9907,4.5226,82.7789,109.4353,ms
+Client Failure Rate,0.0000,0.0000,0.0000,0.0000,%
+System Throughput,1.5943,0.6474,0.0000,2.3001,req/s
+System Response Time,0.0906,0.0130,0.0732,0.1130,ms
+Task1 Throughput,1.5943,0.6474,0.0000,2.3001,req/s
+Task1 Response Time,90.5692,13.0017,73.1550,113.0047,ms
+Task1 CPU Utilization,0.0744,0.0175,0.0373,0.0980,cores
+Task1 Replicas,1.0000,0.0000,1.0000,1.0000,pods
+Task2 Throughput,1.5976,0.6136,0.0000,2.3001,req/s
+Task2 Response Time,104.7368,18.9922,75.3462,130.9675,ms
+Task2 CPU Utilization,0.0797,0.0344,0.0008,0.1372,cores
+Task2 Replicas,1.0000,0.0000,1.0000,1.0000,pods

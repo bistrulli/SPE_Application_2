@@ -1,0 +1,132 @@
+
+---
+# --- TASK1 Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task1-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: task1
+  template:
+    metadata:
+      labels:
+        app: task1
+    spec:
+      containers:
+      - name: app
+        image: bistrulli/generic-microservice-tester:0.8-exp-multi
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "1536Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1536Mi"
+        env:
+        - name: SERVICE_NAME
+          value: "task1"
+        - name: SERVICE_TIME_SECONDS
+          value: "0.1"
+        - name: OUTBOUND_CALLS
+          value: "ASYNC:task2-svc:1.0"
+        - name: GUNICORN_WORKERS
+          value: "20"
+        - name: GUNICORN_THREADS
+          value: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: task1-svc
+spec:
+  selector:
+    app: task1
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: 8080
+
+---
+# --- Istio DestinationRule for TASK1 ---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: task1-random-lb
+spec:
+  host: task1-svc
+  trafficPolicy:
+    loadBalancer:
+      simple: RANDOM
+
+---
+# --- TASK2 Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task2-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: task2
+  template:
+    metadata:
+      labels:
+        app: task2
+    spec:
+      containers:
+      - name: app
+        image: bistrulli/generic-microservice-tester:0.8-exp-multi
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "1536Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1536Mi"
+        env:
+        - name: SERVICE_NAME
+          value: "task2"
+        - name: SERVICE_TIME_SECONDS
+          value: "0.1"
+        - name: OUTBOUND_CALLS
+          value: ""
+        - name: GUNICORN_WORKERS
+          value: "20"
+        - name: GUNICORN_THREADS
+          value: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: task2-svc
+spec:
+  selector:
+    app: task2
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: 8080
+
+---
+# --- Istio DestinationRule for TASK2 ---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: task2-random-lb
+spec:
+  host: task2-svc
+  trafficPolicy:
+    loadBalancer:
+      simple: RANDOM
