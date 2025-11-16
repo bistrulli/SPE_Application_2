@@ -26,7 +26,7 @@ jmt:
     # This will be calculated as: locust_users
     customers: 1
     # Station where customers start (delay station)
-    reference_station: "Delay 1"
+    reference_station: "Delay"
 
 # Kubernetes Configuration
 kubernetes:
@@ -40,7 +40,7 @@ kubernetes:
 mapping:
   # Delay station (think time)
   delay:
-    jmt_station: "Delay 1"
+    jmt_station: "Delay"
     station_type: "Delay"
     update_params:
       - think_time_lambda  # Will be set based on workload.think_time
@@ -66,7 +66,7 @@ mapping:
 # Workload Configuration
 workload:
   # For OPEN networks: arrival rate (requests per second)
-  arrival_rate: 2.0
+  arrival_rate: 1.0
 
   # For CLOSED networks: think time between requests (seconds)
   # This will be used to set lambda in the Delay station

@@ -54,32 +54,21 @@ class PrometheusCollector:
     workload generation experiments.
     """
 
-    # Queries for Kubernetes/Istio microservices environment
+    # Parametric query templates for Kubernetes/Istio microservices
+    # These templates use placeholders {deployment}, {service}, {task} that get substituted at runtime
+    QUERY_TEMPLATES = {
+        # Throughput: successful requests per second (2xx, 3xx responses)
+        'throughput': 'sum(rate(istio_requests_total{{destination_workload="{deployment}",response_code=~"2.*|3.*",reporter="source"}}[1m]))',
+
+        # Response time: average response time from Istio (in milliseconds)
+        'response_time': 'sum(rate(istio_request_duration_milliseconds_sum{{destination_service_name="{service}"}}[1m])) / sum(rate(istio_request_duration_milliseconds_count{{destination_service_name="{service}"}}[1m]))',
+
+        # CPU usage: CPU utilization for task pods (excluding sidecar)
+        'cpu_usage': 'sum(rate(container_cpu_usage_seconds_total{{namespace="default", pod=~"{task}-.*", container!="POD", container!="istio-proxy"}}[1m]))',
+    }
+
+    # Fixed queries for Locust metrics (non-parametric)
     QUERIES = {
-        # Throughput: successful requests per second at gateway level
-        'throughput': 'sum(rate(istio_requests_total{destination_service_name="task1-svc", response_code="200"}[1m]))',
-
-        # Response time: average response time from Istio
-        'response_time_avg': 'sum(rate(istio_request_duration_milliseconds_sum{destination_service_name="task1-svc"}[1m])) / sum(rate(istio_request_duration_milliseconds_count{destination_service_name="task1-svc"}[1m]))',
-
-        # CPU usage for task1 pods
-        'cpu_usage_task1': 'sum(rate(container_cpu_usage_seconds_total{namespace="default", pod=~"task1-.*", container!="POD", container!="istio-proxy"}[1m]))',
-
-        # CPU usage for task2 pods
-        'cpu_usage_task2': 'sum(rate(container_cpu_usage_seconds_total{namespace="default", pod=~"task2-.*", container!="POD", container!="istio-proxy"}[1m]))',
-
-        # Task1 specific throughput
-        'throughput_task1': 'sum(rate(istio_requests_total{destination_service_name="task1-svc"}[1m]))',
-
-        # Task2 specific throughput
-        'throughput_task2': 'sum(rate(istio_requests_total{destination_service_name="task2-svc"}[1m]))',
-
-        # Task1 response time
-        'response_time_task1': 'sum(rate(istio_request_duration_milliseconds_sum{destination_service_name="task1-svc"}[1m])) / sum(rate(istio_request_duration_milliseconds_count{destination_service_name="task1-svc"}[1m]))',
-
-        # Task2 response time
-        'response_time_task2': 'sum(rate(istio_request_duration_milliseconds_sum{destination_service_name="task2-svc"}[1m])) / sum(rate(istio_request_duration_milliseconds_count{destination_service_name="task2-svc"}[1m]))',
-
         # Locust metrics (from Prometheus exporter on port 9646)
         'locust_users': 'locust_users',
         'locust_requests_per_second': 'locust_requests_per_second',
@@ -163,55 +152,113 @@ class PrometheusCollector:
         except requests.RequestException as e:
             raise ConnectionError(f"Failed to query Prometheus range: {e}")
 
-    def get_current_metrics(self, metrics: List[str] = None) -> Dict[str, float]:
+    def _execute_parametric_query(
+        self,
+        template_name: str,
+        params: Dict[str, str],
+        time_point: Optional[float] = None
+    ) -> Optional[float]:
         """
-        Get current values for standard M/M/1 metrics.
+        Execute a parametric query with parameter substitution.
 
         Args:
-            metrics: List of metric names to collect (default: all standard metrics)
+            template_name: Name of the query template from QUERY_TEMPLATES
+            params: Dictionary with parameter values (e.g., {'deployment': 'task1-deployment', 'service': 'task1-svc', 'task': 'task1'})
+            time_point: Unix timestamp for point-in-time query (optional)
 
         Returns:
-            Dictionary mapping metric names to current values
+            Float value of the metric, or None if query fails or returns no data
         """
-        if metrics is None:
-            metrics = list(self.QUERIES.keys())
+        if template_name not in self.QUERY_TEMPLATES:
+            raise ValueError(f"Unknown query template: {template_name}")
 
+        # Get the template and substitute parameters
+        query_template = self.QUERY_TEMPLATES[template_name]
+        query = query_template.format(**params)
+
+        try:
+            response = self.query(query, time_point)
+
+            if response['status'] == 'success' and response['data']['result']:
+                # Take the first result if multiple series returned
+                value = float(response['data']['result'][0]['value'][1])
+
+                # Convert response times from milliseconds to seconds
+                if template_name == 'response_time':
+                    value = value / 1000.0  # Convert ms to seconds
+
+                return value
+            else:
+                return None
+
+        except Exception:
+            return None
+
+    def get_current_metrics(
+        self,
+        deployments: Dict[str, Dict] = None,
+        metrics: List[str] = None
+    ) -> Dict[str, float]:
+        """
+        Get current values for metrics using parametric queries.
+
+        Args:
+            deployments: Dictionary mapping deployment names to their config.
+                        Format: {'task1-deployment': {'service': 'task1-svc', 'task': 'task1'}, ...}
+                        If None, only Locust metrics will be collected.
+            metrics: List of metric types to collect from QUERY_TEMPLATES (e.g., ['throughput', 'response_time', 'cpu_usage'])
+                    Plus any Locust metrics from QUERIES. If None, collects all available metrics.
+
+        Returns:
+            Dictionary mapping metric names to current values.
+            Keys are formatted as: {metric_type}_{deployment/service/task}
+            Examples: 'throughput_task1-deployment', 'response_time_task1-svc', 'cpu_usage_task1', 'locust_users'
+        """
         results = {}
-        for metric in metrics:
-            if metric not in self.QUERIES:
-                raise ValueError(f"Unknown metric: {metric}")
 
-            try:
-                # Handle CPU usage specially to find container dynamically
-                if metric == 'cpu_usage':
-                    container_id = self._find_mm1_container_id()
-                    if container_id:
-                        query = f'rate(container_cpu_usage_seconds_total{{id="{container_id}"}}[1m])'
+        # Determine which parametric metrics to collect
+        if metrics is None:
+            parametric_metrics = list(self.QUERY_TEMPLATES.keys())
+            locust_metrics = list(self.QUERIES.keys())
+        else:
+            parametric_metrics = [m for m in metrics if m in self.QUERY_TEMPLATES]
+            locust_metrics = [m for m in metrics if m in self.QUERIES]
+
+        # Collect parametric metrics for each deployment
+        if deployments:
+            for deployment_name, deployment_config in deployments.items():
+                for metric_type in parametric_metrics:
+                    # Build parameters dict from deployment config
+                    params = {
+                        'deployment': deployment_name,
+                        'service': deployment_config.get('service', ''),
+                        'task': deployment_config.get('task', '')
+                    }
+
+                    # Execute parametric query
+                    value = self._execute_parametric_query(metric_type, params)
+
+                    # Create result key based on metric type
+                    # throughput uses deployment, response_time uses service, cpu_usage uses task
+                    if metric_type == 'throughput':
+                        result_key = f"{metric_type}_{deployment_name}"
+                    elif metric_type == 'response_time':
+                        result_key = f"{metric_type}_{deployment_config.get('service', '')}"
+                    elif metric_type == 'cpu_usage':
+                        result_key = f"{metric_type}_{deployment_config.get('task', '')}"
                     else:
-                        query = self.QUERIES[metric]  # Fallback to default
-                else:
-                    query = self.QUERIES[metric]
+                        result_key = f"{metric_type}_{deployment_name}"
 
+                    results[result_key] = value
+
+        # Collect Locust metrics (non-parametric)
+        for metric in locust_metrics:
+            try:
+                query = self.QUERIES[metric]
                 response = self.query(query)
 
-                # If CPU query fails and we had a cached container ID, invalidate cache and retry
-                if metric == 'cpu_usage' and (response['status'] != 'success' or not response['data']['result']):
-                    if self._mm1_container_id:
-                        print(f"CPU query failed with cached container ID, invalidating cache and retrying...")
-                        self._mm1_container_id = None  # Invalidate cache
-                        container_id = self._find_mm1_container_id()  # Re-discover
-                        if container_id:
-                            query = f'rate(container_cpu_usage_seconds_total{{id="{container_id}"}}[1m])'
-                            response = self.query(query)  # Retry query
-
                 if response['status'] == 'success' and response['data']['result']:
-                    # Take the first result if multiple series returned
                     value = float(response['data']['result'][0]['value'][1])
-
-                    # Convert response times from milliseconds to seconds
-                    if metric == 'response_time_avg':
-                        value = value / 1000.0  # Convert ms to seconds
-
                     results[metric] = value
                 else:
                     results[metric] = None
@@ -224,6 +271,7 @@ class PrometheusCollector:
     def collect_metrics_during_experiment(
         self,
         duration: float,
+        deployments: Dict[str, Dict] = None,
         metrics: List[str] = None,
         interval: float = 5.0
     ) -> Dict[str, List[Tuple[float, float]]]:
@@ -232,18 +280,21 @@ class PrometheusCollector:
 
         Args:
             duration: How long to collect metrics (seconds)
-            metrics: Which metrics to collect (default: key performance metrics)
+            deployments: Dictionary mapping deployment names to their config
+            metrics: Which metric types to collect (default: all parametric + Locust metrics)
             interval: Collection interval in seconds
 
         Returns:
             Dictionary mapping metric names to lists of (timestamp, value) tuples
+            Keys are formatted as: {metric_type}_{deployment/service/task}
         """
         if metrics is None:
-            metrics = ['throughput', 'response_time_avg', 'response_time_95p', 'cpu_usage']
+            metrics = list(self.QUERY_TEMPLATES.keys()) + list(self.QUERIES.keys())
 
         print(f"Collecting metrics for {duration}s (every {interval}s)...")
 
-        results = {metric: [] for metric in metrics}
+        # Initialize results dict - we don't know all keys upfront for parametric queries
+        results = {}
         start_time = time.time()
         next_collection = start_time
 
@@ -251,12 +302,14 @@ class PrometheusCollector:
             current_time = time.time()
             if current_time >= next_collection:
                 timestamp = current_time
-                current_values = self.get_current_metrics(metrics)
+                current_values = self.get_current_metrics(deployments, metrics)
 
-                for metric in metrics:
-                    value = current_values.get(metric)
+                # Add values to results (create new keys as needed)
+                for metric_key, value in current_values.items():
                     if value is not None:
-                        results[metric].append((timestamp, value))
+                        if metric_key not in results:
+                            results[metric_key] = []
+                        results[metric_key].append((timestamp, value))
 
                 next_collection += interval
                 print(f"  Collected at t={current_time-start_time:.1f}s")
@@ -269,63 +322,106 @@ class PrometheusCollector:
         self,
         start_time: float,
         end_time: float,
+        deployments: Dict[str, Dict] = None,
         metrics: List[str] = None,
         step: str = "5s"
     ) -> Dict[str, MetricSeries]:
         """
-        Retrieve metrics for a specific time range.
+        Retrieve metrics for a specific time range using parametric queries.
 
         Args:
             start_time: Start timestamp (Unix time)
             end_time: End timestamp (Unix time)
-            metrics: Metrics to retrieve
-            step: Query resolution
+            deployments: Dictionary mapping deployment names to their config.
+                        Format: {'task1-deployment': {'service': 'task1-svc', 'task': 'task1'}, ...}
+            metrics: List of metric types to collect. If None, collects all available metrics.
+            step: Query resolution (e.g., "5s", "1m")
 
         Returns:
             Dictionary mapping metric names to MetricSeries objects
+            Keys are formatted as: {metric_type}_{deployment/service/task}
         """
-        if metrics is None:
-            metrics = ['throughput', 'response_time_avg', 'cpu_usage']
-
         results = {}
-        for metric in metrics:
-            if metric not in self.QUERIES:
-                continue
 
+        # Determine which metrics to collect
+        if metrics is None:
+            parametric_metrics = list(self.QUERY_TEMPLATES.keys())
+            locust_metrics = list(self.QUERIES.keys())
+        else:
+            parametric_metrics = [m for m in metrics if m in self.QUERY_TEMPLATES]
+            locust_metrics = [m for m in metrics if m in self.QUERIES]
+
+        # Collect parametric metrics for each deployment
+        if deployments:
+            for deployment_name, deployment_config in deployments.items():
+                for metric_type in parametric_metrics:
+                    try:
+                        # Build parameters dict
+                        params = {
+                            'deployment': deployment_name,
+                            'service': deployment_config.get('service', ''),
+                            'task': deployment_config.get('task', '')
+                        }
+
+                        # Get query template and substitute parameters
+                        query_template = self.QUERY_TEMPLATES[metric_type]
+                        query = query_template.format(**params)
+
+                        # Execute range query
+                        response = self.query_range(query, start_time, end_time, step)
+
+                        if response['status'] == 'success' and response['data']['result']:
+                            # Take first result series
+                            series_data = response['data']['result'][0]
+                            labels = series_data.get('metric', {})
+                            points = []
+
+                            for timestamp, value in series_data['values']:
+                                converted_value = float(value)
+
+                                # Convert response times from milliseconds to seconds
+                                if metric_type == 'response_time':
+                                    converted_value = converted_value / 1000.0
+
+                                points.append(MetricPoint(
+                                    timestamp=float(timestamp),
+                                    value=converted_value
+                                ))
+
+                            # Create result key
+                            if metric_type == 'throughput':
+                                result_key = f"{metric_type}_{deployment_name}"
+                            elif metric_type == 'response_time':
+                                result_key = f"{metric_type}_{deployment_config.get('service', '')}"
+                            elif metric_type == 'cpu_usage':
+                                result_key = f"{metric_type}_{deployment_config.get('task', '')}"
+                            else:
+                                result_key = f"{metric_type}_{deployment_name}"
+
+                            results[result_key] = MetricSeries(
+                                metric_name=result_key,
+                                labels=labels,
+                                points=points
+                            )
+
+                    except Exception as e:
+                        print(f"Warning: Failed to retrieve {metric_type} for {deployment_name}: {e}")
+
+        # Collect Locust metrics (non-parametric)
+        for metric in locust_metrics:
             try:
-                # Handle CPU usage specially to find container dynamically
-                if metric == 'cpu_usage':
-                    container_id = self._find_mm1_container_id()
-                    if container_id:
-                        query = f'rate(container_cpu_usage_seconds_total{{id="{container_id}"}}[1m])'
-                    else:
-                        query = self.QUERIES[metric]  # Fallback to default
-                else:
-                    query = self.QUERIES[metric]
-
-                response = self.query_range(
-                    query,
-                    start_time,
-                    end_time,
-                    step
-                )
+                query = self.QUERIES[metric]
+                response = self.query_range(query, start_time, end_time, step)
 
                 if response['status'] == 'success' and response['data']['result']:
-                    # Take first result series
                     series_data = response['data']['result'][0]
                     labels = series_data.get('metric', {})
                     points = []
 
                     for timestamp, value in series_data['values']:
-                        converted_value = float(value)
-
-                        # Convert response times from milliseconds to seconds
-                        if metric == 'response_time_avg':
-                            converted_value = converted_value / 1000.0  # Convert ms to seconds
-
                         points.append(MetricPoint(
                             timestamp=float(timestamp),
-                            value=converted_value
+                            value=float(value)
                         ))
 
                     results[metric] = MetricSeries(
@@ -416,7 +512,7 @@ class PrometheusCollector:
 
             return result
 
-        except Exception as e:
+        except Exception:
             # Return zeros if exporter not available
             return {
                 'locust_users': 0,
@@ -526,26 +622,31 @@ def correlate_workload_and_metrics(
 
 
 # Convenience functions for common use cases
-def quick_metrics_snapshot(prometheus_url: str = "http://localhost:9090") -> Dict[str, float]:
+def quick_metrics_snapshot(
+    prometheus_url: str = "http://localhost:9090",
+    deployments: Dict[str, Dict] = None
+) -> Dict[str, float]:
     """
-    Quick snapshot of current M/M/1 system metrics.
+    Quick snapshot of current system metrics.
 
     Args:
         prometheus_url: Prometheus server URL
+        deployments: Dictionary mapping deployment names to their config
 
     Returns:
         Dictionary with current metric values
     """
     collector = PrometheusCollector(prometheus_url)
     try:
-        return collector.get_current_metrics()
+        return collector.get_current_metrics(deployments)
     finally:
         collector.close()
 
 
 def monitor_during_workload(
     workload_duration: float,
-    prometheus_url: str = "http://localhost:9090"
+    prometheus_url: str = "http://localhost:9090",
+    deployments: Dict[str, Dict] = None
 ) -> Dict[str, List[Tuple[float, float]]]:
     """
     Monitor key metrics during a workload generation session.
@@ -553,13 +654,14 @@ def monitor_during_workload(
     Args:
         workload_duration: Duration to monitor (seconds)
         prometheus_url: Prometheus server URL
+        deployments: Dictionary mapping deployment names to their config
 
     Returns:
         Time series data for key metrics
     """
     collector = PrometheusCollector(prometheus_url)
     try:
-        return collector.collect_metrics_during_experiment(workload_duration)
+        return collector.collect_metrics_during_experiment(workload_duration, deployments)
     finally:
         collector.close()
 

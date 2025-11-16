@@ -458,18 +458,10 @@ class JMTValidator:
                 if result.stdout:
                     print(f"  Output: {result.stdout}")
 
-            # Parse results from output file
-            # JMVA creates a file named <original>-result.jmva
-            model_dir = Path(model_path).parent
-            model_name = Path(model_path).stem
-            result_file = model_dir / f"{model_name}-result.jmva"
-
-            if not result_file.exists():
-                print(f"❌ Results file not found: {result_file}")
-                return {}
-
+            # JMT writes results directly back into the input file
+            # Parse results from the same input file
             print(f"✅ JMVA solution completed")
-            results = self._parse_jmva_results(str(result_file))
+            results = self._parse_jmva_results(model_path)
             return results
 
         except subprocess.TimeoutExpired:
@@ -483,10 +475,10 @@ class JMTValidator:
 
     def _parse_jmva_results(self, result_path: str) -> Dict:
         """
-        Parse JMVA results from the -result.jmva file.
+        Parse JMVA results from the input file (JMT writes results back into the same file).
 
         Args:
-            result_path: Path to JMVA results file
+            result_path: Path to JMVA model file (contains results after execution)
 
         Returns:
             Dictionary with results per station {station_name: {metric: value}}
@@ -498,45 +490,63 @@ class JMTValidator:
             root = tree.getroot()
 
             # Find solutions element
-            solutions = root.find('.//solutions')
+            solutions = root.find('solutions')
             if solutions is None:
                 print("  ⚠️  No solutions found in JMVA results")
                 return results
 
-            # Iterate through stations
-            for station_elem in solutions.findall('.//stationresults'):
+            # Check if solutions are valid
+            if solutions.get('ok') != 'true':
+                print(f"  ⚠️  JMVA solutions marked as not ok: {solutions.get('ok')}")
+                return results
+
+            # Find algorithm element (should be MVA)
+            algorithm = solutions.find('algorithm')
+            if algorithm is None:
+                print("  ⚠️  No algorithm results found")
+                return results
+
+            # Iterate through station results
+            for station_elem in algorithm.findall('stationresults'):
                 station_name = station_elem.get('station')
                 if not station_name:
                     continue
 
                 station_results = {}
 
-                # Extract metrics for each class
-                for class_results in station_elem.findall('.//classresults'):
-                    # Get throughput
-                    throughput_elem = class_results.find('throughput')
-                    if throughput_elem is not None and throughput_elem.text:
-                        station_results['throughput'] = float(throughput_elem.text)
+                # Extract metrics from classresults
+                class_results = station_elem.find('classresults')
+                if class_results is None:
+                    continue
 
-                    # Get response time (residence time)
-                    res_time_elem = class_results.find('residencetime')
-                    if res_time_elem is not None and res_time_elem.text:
-                        station_results['response_time'] = float(res_time_elem.text)
+                # Parse all <measure> elements
+                for measure in class_results.findall('measure'):
+                    measure_type = measure.get('measureType')
+                    mean_value = measure.get('meanValue')
+                    successful = measure.get('successful', 'true')
 
-                    # Get utilization
-                    util_elem = class_results.find('utilization')
-                    if util_elem is not None and util_elem.text:
-                        station_results['utilization'] = float(util_elem.text)
+                    if successful != 'true':
+                        continue
 
-                    # Get queue length
-                    queue_len_elem = class_results.find('queuelength')
-                    if queue_len_elem is not None and queue_len_elem.text:
-                        station_results['queue_length'] = float(queue_len_elem.text)
+                    if mean_value is None:
+                        continue
+
+                    # Map measure types to our metric names
+                    if measure_type == 'Throughput':
+                        station_results['throughput'] = float(mean_value)
+                    elif measure_type == 'Residence time':
+                        station_results['response_time'] = float(mean_value)
+                    elif measure_type == 'Utilization':
+                        station_results['utilization'] = float(mean_value)
+                    elif measure_type == 'Number of Customers':
+                        station_results['queue_length'] = float(mean_value)
 
                 if station_results:
                     results[station_name] = station_results
 
             print(f"  📊 Parsed {len(results)} station results from JMVA")
+            for station, metrics in results.items():
+                print(f"    - {station}: {list(metrics.keys())}")
 
         except Exception as e:
             print(f"⚠️  Error parsing JMVA results: {e}")
@@ -743,20 +753,25 @@ class JMTValidator:
             }
 
             # Extract measured metrics for this task
-            # Try multiple column name patterns
+            # Try multiple column name patterns (including parametric query naming)
+            # Parametric queries use: {deployment}, {service}, {task}
+            service_name = f"{task_name}-svc"
+
             throughput_cols = [
-                f'throughput_{task_name}',
+                f'throughput_{deployment}',           # Parametric: throughput_task1-deployment
+                f'throughput_{task_name}',           # Legacy: throughput_task1
                 f'{task_name}_throughput',
                 'throughput'
             ]
             rt_cols = [
-                f'response_time_{task_name}',
+                f'response_time_{service_name}',     # Parametric: response_time_task1-svc
+                f'response_time_{task_name}',        # Legacy: response_time_task1
                 f'{task_name}_response_time',
                 f'rt_{task_name}',
                 'response_time_avg'
             ]
             cpu_cols = [
-                f'cpu_usage_{task_name}',
+                f'cpu_usage_{task_name}',            # Parametric & Legacy: cpu_usage_task1
                 f'{task_name}_cpu',
                 f'util_{task_name}'
             ]

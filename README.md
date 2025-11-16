@@ -1,634 +1,410 @@
-# SPE Application 2 - Performance Testing & Validation Framework
+# Kubernetes Microservices Performance Validation Framework
 
-Automated framework for performance testing of microservice architectures on Kubernetes with validation through analytical models (JMT/JMVA).
+A comprehensive framework for validating Kubernetes microservice architectures against queueing theory models using JMT (Java Modelling Tools). This tool enables performance testing, metrics collection, and theoretical model validation.
 
-## 🎯 Objectives
+## Overview
 
-This framework enables:
+This framework provides an end-to-end solution for:
+- **Deploying** microservice architectures on Kubernetes
+- **Generating** load using Locust
+- **Collecting** metrics from Prometheus (Istio service mesh)
+- **Validating** against JMT analytical queueing models
+- **Analyzing** performance with what-if scenarios
 
-1. **Performance testing** of Kubernetes deployments with controlled workloads
-2. **Metrics collection** from Istio service mesh, Prometheus, and Locust
-3. **Consolidated statistics** generation (mean values, standard deviation, min/max)
-4. **Results validation** by comparing experimental measurements with analytical model predictions (JMVA - Mean Value Analysis)
-5. **Visualization** of temporal trends and mean values through plots
+The goal is to bridge the gap between theoretical queueing network models and real-world Kubernetes deployments, enabling students and practitioners to validate their performance models empirically.
 
-## 🛠️ Tools Used
+## Core Concepts
 
-- **Kubernetes**: Container orchestration (tested with minikube)
-- **Istio**: Service mesh for telemetry and network metrics
-- **Prometheus**: Time-series metrics collection and storage
-- **Locust**: HTTP workload generation
-- **JMT (Java Modelling Tools)**: Analytical queueing model solver (MVA)
-- **Python 3.8+**: Scripting and automation
+### Queueing Theory and JMT
 
-## 📋 Prerequisites
+**Queueing Network Models** represent systems where requests (customers) flow through service stations (servers). Key metrics include:
+- **Throughput**: Requests processed per unit time (req/s)
+- **Response Time**: Time from request arrival to completion (s)
+- **Utilization**: Fraction of time a server is busy (0-1)
 
-### Required Software
+**Closed Networks**: Fixed number of customers circulating in the system. After completing a request, a customer "thinks" for some time before submitting the next request.
 
-```bash
-# Kubernetes cluster (minikube recommended)
-minikube start --memory=4096 --cpus=4
+**JMT (Java Modelling Tools)** is an open-source suite for performance evaluation:
+- **JMVA**: Analytical Mean Value Analysis solver (fast, exact for simple models)
+- **JSIMgraph**: Discrete-event simulation (handles complex scenarios)
 
-# Istio service mesh
-istioctl install --set profile=default -y
-kubectl label namespace default istio-injection=enabled
+### Kubernetes and Istio
 
-# Prometheus (if not already included with Istio)
-kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/addons/prometheus.yaml
+**Kubernetes** orchestrates containerized microservices with:
+- **Deployments**: Define desired state (replicas, resource limits)
+- **Services**: Network abstraction for accessing pods
+- **Horizontal scaling**: Adjust replica count based on load
 
-# Enable Istio metrics
-kubectl apply -f QNonK8s/istio/telemetry.yaml
-```
+**Istio Service Mesh** provides:
+- Traffic management
+- **Observability**: Automatic metrics collection
+- Request-level telemetry (throughput, latency, errors)
 
-### Python Dependencies
+### Prometheus and Locust
 
-```bash
-pip install -r requirements.txt
-```
+**Prometheus** is a time-series database for metrics:
+- Scrapes metrics from Istio sidecars
+- PromQL query language for aggregations
+- Key metrics: `istio_requests_total`, `istio_request_duration_milliseconds`
 
-**File `requirements.txt`:**
-```
-requests>=2.31.0
-pandas>=2.0.0
-numpy>=1.24.0
-matplotlib>=3.7.0
-kubernetes>=28.0.0
-prometheus-client>=0.19.0
-pyyaml>=6.0
-locust>=2.18.0
-```
+**Locust** is a Python-based load testing tool:
+- Simulates user behavior
+- Configurable think time and user count
+- Exports metrics via Prometheus endpoint
 
-### JMT (optional, for validation only)
-
-Download JMT from: http://jmt.sourceforge.net/
-
-Place the JAR in a known directory (e.g., `/Users/emilio-imt/JMT-singlejar-1.2.2.jar`)
-
-## 🚀 Quick Start
-
-### Basic Example
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant \
-  --users 10 \
-  --think-time 1.0 \
-  --duration 120
-```
-
-### Example with JMT Validation
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant \
-  --users 1 \
-  --think-time 1.0 \
-  --duration 300 \
-  --validate-jmt experiment_mapping.yaml
-```
-
-## 📊 Test Modes
-
-### 1. Constant Load (`--mode constant`)
-
-Generates a fixed number of concurrent users for the entire test duration.
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant \
-  --users 50 \
-  --think-time 0.5 \
-  --duration 300
-```
-
-**Main parameters:**
-- `--users N`: Number of concurrent users
-- `--think-time T`: Wait time between requests (seconds)
-- `--duration D`: Test duration (seconds)
-
-### 2. Trace-Based Load (`--mode trace`)
-
-Uses real load traces for more realistic patterns.
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode trace \
-  --trace-file QNonK8s/locust/workloads/sin800.csv \
-  --amplitude 50 \
-  --shift 10 \
-  --duration 600 \
-  --fit-trace
-```
-
-**Parameters:**
-- `--trace-file PATH`: CSV file with load trace
-- `--amplitude A`: Maximum users above baseline
-- `--shift S`: Minimum users (baseline)
-- `--fit-trace`: Fit trace to specified duration
-
-**Available traces:**
-- `QNonK8s/locust/workloads/sin800.csv` - Sinusoidal pattern
-- `QNonK8s/locust/workloads/twitter.csv` - Real Twitter trace
-
-## 📈 Generated Output
-
-Each experiment creates a `results/experiment_YYYYMMDD_HHMMSS/` directory with:
-
-### 1. Summary Statistics (Main File)
-
-**`experiment_YYYYMMDD_HHMMSS_summary.csv`**
-
-Contains **only mean values** of all metrics, directly comparable with JMT:
-
-| Metric | Mean | Std Dev | Min | Max | Unit |
-|--------|------|---------|-----|-----|------|
-| Users | 1.0000 | 0.0000 | 1.0 | 1.0 | users |
-| Client RPS | 0.8357 | 0.0234 | 0.81 | 0.86 | req/s |
-| Client Response Time | 100.12 | 5.23 | 95.5 | 110.0 | ms |
-| System Throughput | 0.8357 | 0.0234 | 0.81 | 0.86 | req/s |
-| Task1 Throughput | 0.8357 | 0.0234 | 0.81 | 0.86 | req/s |
-| Task1 Response Time | 99.44 | 2.15 | 96.85 | 102.04 | ms |
-| Task1 CPU Utilization | 0.0828 | 0.0012 | 0.0807 | 0.0849 | cores |
-| Task2 Throughput | 0.8341 | 0.0245 | 0.81 | 0.8597 | req/s |
-| Task2 Response Time | 101.33 | 1.89 | 98.99 | 103.68 | ms |
-| Task2 CPU Utilization | 0.0841 | 0.0015 | 0.0819 | 0.0863 | cores |
-
-### 2. Detailed Time Series
-
-**`experiment_YYYYMMDD_HHMMSS_timeseries.csv`**
-
-Complete time series with all metrics collected every N seconds (default: 5s).
-
-**Columns:**
-- `timestamp`, `elapsed` - Time
-- `locust_users`, `locust_requests_per_second`, `locust_response_time_avg`, `locust_failure_rate` - Locust client metrics
-- `throughput`, `response_time_avg` - Aggregated system metrics
-- `throughput_taskN`, `response_time_taskN`, `cpu_usage_taskN` - Per-task metrics
-- `taskN_replicas` - Number of replicas per deployment
-
-### 3. Plots
-
-**`plots_YYYYMMDD_HHMMSS.png`**
-
-Four subplots with dashed lines showing mean values:
-1. **Throughput over time** - Server vs Client
-2. **Response Time over time** - Server vs Client
-3. **CPU Utilization over time** - Task1 and Task2
-4. **Active Users over time** - Load profile
-
-### 4. JMT Validation Report (optional)
-
-**`jmt_validation_YYYYMMDD_HHMMSS.txt`**
-
-Per-station comparison between experimental measurements and MVA predictions:
+## Architecture
 
 ```
-============================================================
-JMT Model Validation Report
-============================================================
-
-## Per-Station Comparison
-------------------------------------------------------------
-
-### task1 <-> Tier1
-
-  Metric          | Measured      | Theoretical   | Error %
-  --------------------------------------------------------
-  Throughput      |         0.84  |         0.83  |   1.20%
-  Response Time   |       0.0994s |       0.1000s |   0.60%
-  CPU Utilization |       0.0828  |       0.0830  |   0.24%
-
-### task2 <-> Tier2
-...
-
-## Summary
-------------------------------------------------------------
-  *** OVERALL ASSESSMENT: EXCELLENT ***
+┌─────────────────────┐
+│   Locust Client     │
+│ (Load Generation)   │
+└─────────┬───────────┘
+          │ HTTP Requests
+          ▼
+┌─────────────────────┐
+│  Istio Ingress      │
+│    Gateway          │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐    ┌─────────────────────┐
+│   Task1 Service     │───▶│   Task2 Service     │
+│   (Tier1 in JMT)    │    │   (Tier2 in JMT)    │
+└─────────────────────┘    └─────────────────────┘
+          │                           │
+          └───────────┬───────────────┘
+                      │ Metrics
+                      ▼
+┌─────────────────────┐
+│     Prometheus      │
+│  (Metrics Storage)  │
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  Metrics Collector  │
+│    (Python)         │
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│    JMT Validator    │
+│  (Compare Results)  │
+└─────────────────────┘
 ```
 
-## 🔬 JMT/JMVA Validation
+## File Structure
 
-### JMVA Template Configuration
+```
+SPE_Application_2/
+├── experiment_runner.py      # Main experiment orchestrator
+├── metrics_collector.py      # Prometheus metrics collection
+├── jmt_validator.py          # JMT model validation
+├── whatif_analysis.py        # Multi-experiment analysis
+├── experiment_mapping.yaml   # Configuration mapping
+├── QNonK8s/
+│   ├── applications/
+│   │   └── 3tier.yaml        # K8s deployment manifest
+│   ├── locust/
+│   │   ├── locustfile.py     # Constant load generator
+│   │   └── locustfile_trace.py  # Trace-based load
+│   └── JMT_mva_validation/
+│       └── Closed_3tier.jmva # JMT model template
+└── results/                  # Experiment outputs
+    └── YYYYMMDD_HHMMSS/      # Timestamped results
+```
 
-The `experiment_mapping.yaml` file defines the mapping between Kubernetes deployments and JMT model stations:
+## Configuration
+
+### experiment_mapping.yaml
+
+This file defines the mapping between Kubernetes deployments and JMT queueing stations:
 
 ```yaml
-# experiment_mapping.yaml
-experiment:
-  name: "3tier_closed_validation"
-  description: "Validate 3-tier microservice architecture"
-
+# JMT Configuration
 jmt:
   template: "QNonK8s/JMT_mva_validation/Closed_3tier.jmva"
-  jar_path: "/Users/emilio-imt/JMT-singlejar-1.2.2.jar"
-  solver_type: "mva"  # Analytical MVA solver
-  network_type: "closed"
+  jar_path: "/path/to/JMT.jar"
+  network_type: "closed"  # or "open"
 
   closed_network:
-    customers: 1  # Automatically updated from --users
-    reference_station: "Delay 1"
+    customers: 1  # Will be overwritten by --users
+    reference_station: "Delay"
 
-kubernetes:
-  manifest: "QNonK8s/applications/3tier.yaml"
-  namespace: "default"
-
+# Mapping K8s deployments to JMT stations
 mapping:
   delay:
-    jmt_station: "Delay 1"
+    jmt_station: "Delay"
     station_type: "Delay"
-    update_params:
-      - think_time_lambda
 
   task1-deployment:
     jmt_station: "Tier1"
     station_type: "Server"
     service_time_env_var: "SERVICE_TIME_SECONDS"
-    update_params:
-      - service_time_lambda
-      - num_servers
 
   task2-deployment:
     jmt_station: "Tier2"
     station_type: "Server"
     service_time_env_var: "SERVICE_TIME_SECONDS"
-    update_params:
-      - service_time_lambda
-      - num_servers
 
+# Workload parameters
 workload:
-  think_time: 1.0  # Updated from --think-time
-
-validation:
-  acceptable_error_threshold: 15.0
-  metrics:
-    - throughput
-    - response_time
-    - utilization
+  think_time: 1.0  # Will be overwritten by --think-time
 ```
 
-### Creating JMVA Templates
+### Kubernetes Manifest
 
-1. **Open JMT GUI** and create a model with JMVA (analytical solver)
-2. **Define stations**:
-   - Delay station for think time
-   - Load-Independent stations (listation) for tasks
-3. **Set initial parameters**:
-   - Population (customers) = 1
-   - Service times = 0.1s (will be overwritten)
-   - Think time = 1.0s (will be overwritten)
-4. **Save as `.jmva`** in `QNonK8s/JMT_mva_validation/`
+The deployment manifest (e.g., `3tier.yaml`) defines the microservice architecture:
 
-### Execution with Validation
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant \
-  --users 1 \
-  --think-time 1.0 \
-  --duration 300 \
-  --validate-jmt experiment_mapping.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task1-deployment
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: task1
+        env:
+        - name: SERVICE_TIME_SECONDS
+          value: "0.1"  # Mean service time
 ```
 
-### Internal Workflow
+## Running Experiments
 
-1. **K8s Deploy** of specified manifest
-2. **Start Locust** with configured parameters
-3. **Metrics collection** from Prometheus and Locust (every 5s)
-4. **Statistics computation** (mean, std dev, min, max)
-5. **Parameter extraction** from K8s manifest (service time, replicas)
-6. **JMVA template modification** with real parameters:
-   - `population` = `--users`
-   - `think_time` = `--think-time`
-   - `service_time` from environment variable `SERVICE_TIME_SECONDS`
-   - `servers` = number of replicas
-7. **MVA solver execution**:
-   ```bash
-   java -cp JMT.JAR jmt.commandline.Jmt mva Closed_3tier.jmva
-   ```
-8. **Results parsing** from file `Closed_3tier-result.jmva`
-9. **Comparison** theory vs measurements per station
-10. **Validation report generation**
+### Prerequisites
 
-## 🎓 Example Scenarios
+1. **Kubernetes cluster** with Istio installed
+2. **Prometheus** configured to scrape Istio metrics
+3. **JMT** JAR file downloaded
+4. **Python dependencies**: `pip install pandas matplotlib requests pyyaml locust`
 
-### Scenario 1: M/M/c Model Validation
-
-Verify model correctness with light load:
+### Single Experiment
 
 ```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant \
-  --users 1 \
-  --think-time 1.0 \
-  --duration 300 \
-  --validate-jmt experiment_mapping.yaml
-```
-
-**Expected:**
-- Error < 5% on throughput and response time
-- Assessment: EXCELLENT
-
-### Scenario 2: Scalability Study
-
-Test with different numbers of replicas:
-
-```bash
-# 1 replica
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier_1replica.yaml \
-  --mode constant --users 10 --think-time 0.5 --duration 180 \
-  --output-dir results/scalability/1replica
-
-# 2 replicas
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier_2replicas.yaml \
-  --mode constant --users 10 --think-time 0.5 --duration 180 \
-  --output-dir results/scalability/2replicas
-```
-
-### Scenario 3: Variable Load
-
-Simulate realistic pattern with Twitter trace:
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode trace \
-  --trace-file QNonK8s/locust/workloads/twitter.csv \
-  --amplitude 100 \
-  --shift 20 \
-  --duration 600 \
-  --fit-trace
-```
-
-### Scenario 4: CPU Utilization Study
-
-Test how CPU utilization varies with different loads:
-
-```bash
-for users in 10 20 50 100; do
-  python experiment_runner.py \
+python3 experiment_runner.py \
     --manifest QNonK8s/applications/3tier.yaml \
+    --config experiment_mapping.yaml \
     --mode constant \
-    --users $users \
-    --think-time 0.5 \
-    --duration 180 \
-    --output-dir results/cpu_study/${users}users
-done
+    --users 10 \
+    --think-time 1.0 \
+    --duration 300
 ```
 
-## 🔧 Advanced Parameters
+**Parameters:**
+- `--manifest`: Kubernetes deployment YAML
+- `--config`: Experiment mapping configuration (required)
+- `--mode`: Load type (`constant` or `trace`)
+- `--users`: Number of concurrent users (closed network population)
+- `--think-time`: Mean time between requests (seconds)
+- `--duration`: Experiment duration (seconds)
+- `--skip-jmt-validation`: Skip JMT validation (runs by default)
 
-### All Available Parameters
+**Output:**
+```
+results/20251116_174426/
+├── metrics_timeseries.csv       # Time-series data
+├── summary_statistics.csv       # Aggregated metrics
+├── metrics_plots.png            # Visualization
+├── jmt_validation_report.txt    # Validation results
+├── jmt_validation_results.csv   # Structured comparison
+└── locust_*.csv                 # Locust statistics
+```
+
+### What-If Analysis
+
+Run multiple experiments with varying user loads to analyze system behavior:
 
 ```bash
-python experiment_runner.py \
-  --manifest PATH                    # Kubernetes manifest (required)
-  --mode {constant,trace}            # Test mode (required)
-
-  # Constant mode
-  --users N                          # Number of users
-  --think-time T                     # Think time (seconds)
-  --duration D                       # Test duration (seconds)
-
-  # Trace mode
-  --trace-file PATH                  # Trace CSV file
-  --amplitude A                      # Max users above baseline
-  --shift S                          # Min users (baseline)
-  --fit-trace                        # Fit trace to duration
-  --trace-think-time T               # Think time for trace mode
-
-  # Configuration
-  --namespace NS                     # K8s namespace (default: default)
-  --prometheus-url URL               # Prometheus URL (auto-detect)
-  --locust-host URL                  # Locust target host (auto-detect)
-  --metrics-interval N               # Collection interval (seconds, default: 5)
-  --output-dir DIR                   # Output directory (auto-generate)
-
-  # Options
-  --no-cleanup                       # Don't delete deployment
-  --validate-jmt CONFIG              # Validate with JMT using config file
+python3 whatif_analysis.py \
+    --users-range 1,5,10,20,50 \
+    --manifest QNonK8s/applications/3tier.yaml \
+    --config experiment_mapping.yaml \
+    --think-time 1.0 \
+    --duration 120 \
+    --cooldown 30
 ```
 
-### Prometheus and Ingress Gateway
+**Parameters:**
+- `--users-range`: Comma-separated list of user counts to test
+- `--cooldown`: Seconds to wait between experiments (default: 10)
 
-The script automatically detects:
-- **Prometheus**: Automatic port-forward to `localhost:9090`
-- **Istio Ingress Gateway**: Minikube IP + NodePort
-
-Override manually if needed:
-
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant --users 10 --think-time 1.0 --duration 120 \
-  --prometheus-url http://localhost:9090 \
-  --locust-host http://192.168.49.2:31851
+**Output:**
+```
+results/whatif_20251116_180000/
+├── aggregated_results.csv       # All experiments data
+├── task1_throughput.png         # Measured vs JMT per task
+├── task1_response_time.png
+├── task1_utilization.png
+├── task2_throughput.png
+├── task2_response_time.png
+├── task2_utilization.png
+└── error_distribution.png       # Error boxplot by metric type
 ```
 
-### No Cleanup
+## Understanding Results
 
-Keep deployment active after test (useful for debugging):
+### Validation Report
 
-```bash
-python experiment_runner.py \
-  --manifest QNonK8s/applications/3tier.yaml \
-  --mode constant --users 10 --think-time 1.0 --duration 60 \
-  --no-cleanup
+The `jmt_validation_report.txt` compares measured vs theoretical values:
 
-# Manual cleanup
-kubectl delete -f QNonK8s/applications/3tier.yaml
+```
+### task1 <-> Tier1
+  Metric          | Measured      | Theoretical   | Error %
+  --------------------------------------------------------
+  Throughput      |         0.73  |         0.83  |  12.20%
+  Response Time   |       0.1130s |       0.1000s |  13.00%
+  CPU Utilization |       0.0815  |       0.0833  |   2.16%
 ```
 
-## 📊 Data Analysis
+### Assessment Criteria
 
-### Import Summary Statistics
+- **EXCELLENT**: < 5% average error
+- **GOOD**: 5-10% average error
+- **ACCEPTABLE**: 10-15% average error
+- **NEEDS REVIEW**: > 15% average error
+
+### Error Sources
+
+1. **Prometheus warm-up**: Initial metrics may be delayed (20-45s)
+2. **Distribution mismatch**: Actual service times vs exponential assumption
+3. **Network overhead**: Istio proxy latency not in model
+4. **Measurement granularity**: 1-minute rate windows
+
+## Extending the Framework
+
+### Adding New Services
+
+1. Update Kubernetes manifest with new deployment
+2. Add mapping in `experiment_mapping.yaml`:
+   ```yaml
+   task3-deployment:
+     jmt_station: "Tier3"
+     station_type: "Server"
+     service_time_env_var: "SERVICE_TIME_SECONDS"
+   ```
+3. Update JMT template to include the new station
+4. Run experiments and validate
+
+### Custom Metrics
+
+Add new Prometheus queries in `metrics_collector.py`:
 
 ```python
-import pandas as pd
-
-# Load mean statistics
-summary = pd.read_csv('results/experiment_20241116_143022/experiment_20241116_143022_summary.csv')
-
-print(summary)
-
-# Extract specific metrics
-throughput = summary[summary['Metric'] == 'System Throughput']['Mean'].values[0]
-response_time = summary[summary['Metric'] == 'Client Response Time']['Mean'].values[0]
-
-print(f"Mean throughput: {throughput:.2f} req/s")
-print(f"Mean response time: {response_time:.2f} ms")
+QUERY_TEMPLATES = {
+    'throughput': 'sum(rate(istio_requests_total{...}[1m]))',
+    'response_time': 'sum(rate(...))/sum(rate(...))',
+    'cpu_usage': 'sum(rate(container_cpu_usage_seconds_total{...}[1m]))',
+    # Add your custom metric here
+    'memory_usage': 'sum(container_memory_usage_bytes{...})',
+}
 ```
 
-### Time Series Analysis
+### Different Load Patterns
 
-```python
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# Load time-series
-ts = pd.read_csv('results/experiment_20241116_143022/experiment_20241116_143022_timeseries.csv')
-
-# Plot throughput
-plt.figure(figsize=(12, 6))
-plt.plot(ts['elapsed'], ts['throughput'], label='Throughput', alpha=0.6)
-plt.axhline(y=ts['throughput'].mean(), color='r', linestyle='--', label='Mean')
-plt.xlabel('Time (s)')
-plt.ylabel('Throughput (req/s)')
-plt.title('Throughput Over Time')
-plt.legend()
-plt.grid(True)
-plt.show()
-```
-
-### Compare Experiments
-
-```python
-import pandas as pd
-
-# Load summary from two experiments
-exp1 = pd.read_csv('results/exp1/experiment_X_summary.csv')
-exp2 = pd.read_csv('results/exp2/experiment_Y_summary.csv')
-
-# Compare mean throughput
-tp1 = exp1[exp1['Metric'] == 'System Throughput']['Mean'].values[0]
-tp2 = exp2[exp2['Metric'] == 'System Throughput']['Mean'].values[0]
-
-print(f"Exp1 Throughput: {tp1:.2f} req/s")
-print(f"Exp2 Throughput: {tp2:.2f} req/s")
-print(f"Improvement: {((tp2/tp1 - 1) * 100):.1f}%")
-```
-
-## 🐛 Troubleshooting
-
-### Prometheus Unreachable
+Use trace-based load for realistic workloads:
 
 ```bash
-# Verify Prometheus pod
-kubectl get pods -n istio-system | grep prometheus
-
-# Manual port-forward (script does this automatically)
-kubectl port-forward -n istio-system svc/prometheus 9090:9090
-
-# Test connection
-curl http://localhost:9090/api/v1/query?query=up
+python3 experiment_runner.py \
+    --manifest QNonK8s/applications/3tier.yaml \
+    --config experiment_mapping.yaml \
+    --mode trace \
+    --trace-file QNonK8s/locust/workloads/sin800.csv \
+    --amplitude 50 \
+    --shift 10 \
+    --duration 300
 ```
 
-### Missing Istio Metrics
+## Key Python Modules
 
-```bash
-# Verify Telemetry CRD
-kubectl get telemetry -n istio-system
+### experiment_runner.py
 
-# Apply if missing
-kubectl apply -f QNonK8s/istio/telemetry.yaml
+Main orchestrator that:
+- Deploys Kubernetes manifests
+- Starts Locust load generation
+- Collects Prometheus metrics using parametric queries
+- Runs JMT validation automatically
+- Generates reports and plots
+- Handles cleanup on interruption (Ctrl+C)
 
-# Verify sidecar injection
-kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}'
-```
+### metrics_collector.py
 
-You should see `istio-proxy` among the containers of each pod.
+Parametric Prometheus query system:
+- Template-based queries with placeholder substitution (`{deployment}`, `{service}`, `{task}`)
+- Supports multiple deployments dynamically
+- Filters None/NaN values during Prometheus warm-up period
 
-### Locust Cannot Reach Target
+### jmt_validator.py
 
-```bash
-# Verify ingress gateway
-kubectl get svc -n istio-system istio-ingressgateway
+JMT integration:
+- Extracts service times from K8s manifest environment variables
+- Modifies JMT templates programmatically (XML manipulation)
+- Runs JMVA solver via command line
+- Parses results and compares theoretical vs measured metrics
 
-# For minikube, get IP + NodePort
-minikube ip
-kubectl get svc -n istio-system istio-ingressgateway -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}'
+### whatif_analysis.py
 
-# Manual test
-curl http://$(minikube ip):31851
-```
+Multi-experiment wrapper:
+- Runs experiments with varying user counts
+- Real-time output from each experiment
+- Graceful cleanup on Ctrl+C interruption
+- Aggregates results across experiments
+- Generates comparison plots (measured vs JMT predicted)
+- Creates error distribution box plot
 
-### JMT Validation Fails
+## Theoretical Background
 
-```bash
-# Verify JMT JAR path
-ls -lh /Users/emilio-imt/JMT-singlejar-1.2.2.jar
-
-# Test manual JMT execution
-java -cp /Users/emilio-imt/JMT-singlejar-1.2.2.jar jmt.commandline.Jmt mva QNonK8s/JMT_mva_validation/Closed_3tier.jmva
-
-# Verify results
-cat QNonK8s/JMT_mva_validation/Closed_3tier-result.jmva
-```
-
-## 📁 Repository Structure
+### Little's Law
 
 ```
-SPE_Application_2/
-├── README.md                          # This guide
-├── requirements.txt                   # Python dependencies
-├── experiment_runner.py               # Main script
-├── jmt_validator.py                   # JMT/JMVA validation
-├── metrics_collector.py               # Prometheus metrics collection
-├── experiment_mapping.yaml            # JMT validation configuration
-│
-├── QNonK8s/
-│   ├── applications/                  # Kubernetes manifests
-│   │   ├── 3tier.yaml                 # Standard 3-tier deployment
-│   │   └── ...
-│   │
-│   ├── locust/                        # Locust load testing
-│   │   ├── locustfile.py              # Constant load scenario
-│   │   ├── locustfile_trace.py        # Trace-based scenario
-│   │   ├── locust_prometheus_exporter.py  # Metrics exporter
-│   │   └── workloads/                 # Load traces
-│   │       ├── sin800.csv
-│   │       └── twitter.csv
-│   │
-│   ├── istio/                         # Istio configuration
-│   │   └── telemetry.yaml             # Enable Istio metrics
-│   │
-│   └── JMT_mva_validation/            # JMT templates
-│       └── Closed_3tier.jmva          # 3-tier MVA model
-│
-└── results/                           # Experiment outputs
-    └── experiment_YYYYMMDD_HHMMSS/
-        ├── experiment_*_summary.csv      # Mean statistics
-        ├── experiment_*_timeseries.csv   # Time series
-        ├── plots_*.png                   # Plots
-        └── jmt_validation_*.txt          # Validation report
+L = λ * W
 ```
+- L: Average number in system
+- λ: Arrival rate
+- W: Average time in system
 
-## 📚 References
+### Closed Network Model
 
-- **JMT (Java Modelling Tools)**: http://jmt.sourceforge.net/
-- **JMT User Manual**: https://jmt.sourceforge.net/Papers/JMT_users_Manual.pdf
-- **Locust Documentation**: https://docs.locust.io/
-- **Istio Metrics**: https://istio.io/latest/docs/reference/config/metrics/
-- **Prometheus Query Language**: https://prometheus.io/docs/prometheus/latest/querying/basics/
-- **Kubernetes Python Client**: https://github.com/kubernetes-client/python
+For a closed network with N customers:
+```
+X = N / (Z + R)
+```
+- X: System throughput
+- N: Number of customers
+- Z: Think time
+- R: Total response time
 
-## 💡 Best Practices
+### MVA Algorithm
 
-1. **Incremental testing**: Start with `--duration 60` for quick tests
-2. **Warm-up**: First samples might be unstable
-3. **Steady-state**: Ensure system reaches steady-state
-4. **Validation**: Use `--validate-jmt` only for light loads compatible with MVA
-5. **Documentation**: Version control manifests and document parameters/results
+Mean Value Analysis computes steady-state metrics iteratively:
+1. Start with empty system (N=0)
+2. For each customer added, compute queue lengths, response times, throughput
+3. Uses arrival theorem: arriving customer sees time-average queue length
 
-## 🎓 Student Exercises
+Key advantage: No need to solve balance equations, direct computation.
 
-1. **Verify Little's Law**: Calculate N = X × R from data and compare with `locust_users`
-2. **Saturation**: Find the load that saturates CPU at 100%
-3. **Linear Scalability**: Verify if throughput doubles with 2× replicas
-4. **MVA vs Measurements**: Compare MVA predictions with real experiments
-5. **Response Time Percentiles**: Analyze distribution from time series
+## Best Practices
 
-## ✨ Authors
+1. **Warm-up period**: Allow 30-60s for Prometheus metrics to stabilize
+2. **Experiment duration**: Minimum 120s for statistical significance
+3. **Cooldown between experiments**: Wait for system to reset state
+4. **Multiple runs**: Repeat experiments to account for variability
+5. **Resource limits**: Set CPU/memory limits in K8s to match model assumptions
+6. **Service time calibration**: Measure actual service times, don't assume exponential
+7. **Incremental validation**: Start with simple models (1 user) before complex scenarios
 
-Developed for the Software Performance Engineering course.
+## References
 
-## 📄 License
+- [JMT - Java Modelling Tools](http://jmt.sourceforge.net/)
+- [JMT User Manual](https://jmt.sourceforge.net/Papers/JMT_users_Manual.pdf)
+- [Istio Service Mesh](https://istio.io/latest/docs/)
+- [Prometheus Documentation](https://prometheus.io/docs/)
+- [Locust Load Testing](https://locust.io/)
+- [Kubernetes Documentation](https://kubernetes.io/docs/)
+- Performance Modeling and Design of Computer Systems (Harchol-Balter)
 
-This project is released for educational purposes.
+## License
+
+This framework is provided for educational purposes. See individual components for their respective licenses.

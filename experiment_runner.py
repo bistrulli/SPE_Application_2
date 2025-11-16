@@ -31,6 +31,8 @@ import time
 import os
 import sys
 import signal
+import math
+import yaml
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -62,7 +64,8 @@ class ExperimentRunner:
         locust_host: Optional[str] = None,
         cleanup: bool = True,
         auto_detect_ingress: bool = True,
-        auto_port_forward: bool = True
+        auto_port_forward: bool = True,
+        config_path: Optional[str] = None
     ):
         """
         Initialize the experiment runner.
@@ -76,6 +79,7 @@ class ExperimentRunner:
             cleanup: Whether to cleanup deployments after test
             auto_detect_ingress: Automatically detect Istio Ingress Gateway URL
             auto_port_forward: Automatically setup Prometheus port-forward
+            config_path: Path to experiment_mapping.yaml (for parametric queries)
         """
         self.manifest_path = Path(manifest_path)
         self.namespace = namespace
@@ -83,6 +87,11 @@ class ExperimentRunner:
         self.output_dir = Path(output_dir)
         self.cleanup = cleanup
         self.auto_port_forward = auto_port_forward
+
+        # Load experiment mapping config if provided
+        self.deployments_map = {}
+        if config_path:
+            self.deployments_map = self._load_deployment_mapping(config_path)
 
         # Auto-detect Istio Ingress Gateway if not provided
         if locust_host:
@@ -97,8 +106,10 @@ class ExperimentRunner:
         self.port_forward_process = None
         self.collector = None
 
-        # Generate experiment ID
+        # Generate experiment ID and create timestamped subdirectory
         self.experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.experiment_output_dir = self.output_dir / self.experiment_id
+        self.experiment_output_dir.mkdir(parents=True, exist_ok=True)
 
     def _detect_istio_ingress_gateway(self) -> str:
         """
@@ -179,6 +190,51 @@ class ExperimentRunner:
         except Exception as e:
             print(f"⚠️  Error detecting Ingress Gateway: {e}")
             return "http://localhost:80"
+
+    def _load_deployment_mapping(self, config_path: str) -> Dict[str, Dict]:
+        """
+        Load deployment mapping from experiment_mapping.yaml.
+
+        Args:
+            config_path: Path to experiment_mapping.yaml
+
+        Returns:
+            Dictionary mapping deployment names to their config:
+            {'task1-deployment': {'service': 'task1-svc', 'task': 'task1', 'jmt_station': 'Tier1'}, ...}
+        """
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+
+            deployments_map = {}
+            mapping = config.get('mapping', {})
+
+            for deployment_key, deployment_config in mapping.items():
+                # Skip delay station (not a real deployment)
+                if deployment_key == 'delay':
+                    continue
+
+                # Extract deployment name, service name, and task name
+                # deployment_key is like "task1-deployment"
+                # service name is like "task1-svc"
+                # task name is like "task1"
+                task_name = deployment_key.replace('-deployment', '')
+                service_name = f"{task_name}-svc"
+
+                deployments_map[deployment_key] = {
+                    'service': service_name,
+                    'task': task_name,
+                    'jmt_station': deployment_config.get('jmt_station', '')
+                }
+
+            print(f"✅ Loaded deployment mapping for {len(deployments_map)} deployments")
+            return deployments_map
+
+        except Exception as e:
+            print(f"⚠️  Error loading deployment mapping: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
 
     def start_prometheus_port_forward(self) -> bool:
         """
@@ -368,7 +424,7 @@ class ExperimentRunner:
             '--run-time', f'{duration}s',
             '--host', self.locust_host,
             '--prometheus-port', '9646',
-            '--csv', str(self.output_dir / f'locust_{self.experiment_id}')
+            '--csv', str(self.experiment_output_dir / 'locust')
         ]
 
         try:
@@ -457,7 +513,7 @@ class ExperimentRunner:
             '--headless',
             '--host', self.locust_host,
             '--prometheus-port', '9646',
-            '--csv', str(self.output_dir / f'locust_{self.experiment_id}')
+            '--csv', str(self.experiment_output_dir / 'locust')
         ]
 
         try:
@@ -501,23 +557,19 @@ class ExperimentRunner:
 
         print("✅ Prometheus is healthy")
 
-        # Define metrics to collect
+        # Define metric types to collect (parametric templates + Locust metrics)
         metrics_to_collect = [
             'throughput',
-            'response_time_avg',
-            'cpu_usage_task1',
-            'cpu_usage_task2',
-            'throughput_task1',
-            'throughput_task2',
-            'response_time_task1',
-            'response_time_task2',
+            'response_time',
+            'cpu_usage',
             'locust_users',
             'locust_requests_per_second',
             'locust_response_time_avg',
             'locust_failure_rate'
         ]
 
-        results = {metric: [] for metric in metrics_to_collect}
+        # Initialize results dict (will be populated dynamically with parametric keys)
+        results = {}
         start_time = time.time()
         next_collection = start_time
 
@@ -534,8 +586,11 @@ class ExperimentRunner:
                     elapsed = current_time - start_time
                     timestamp = current_time
 
-                    # Collect current metrics from Prometheus (server-side)
-                    current_values = self.collector.get_current_metrics(metrics_to_collect)
+                    # Collect current metrics from Prometheus (server-side) using parametric queries
+                    current_values = self.collector.get_current_metrics(
+                        deployments=self.deployments_map,
+                        metrics=metrics_to_collect
+                    )
 
                     # Collect Locust metrics directly from exporter (client-side)
                     locust_direct = self.collector.get_locust_metrics_direct()
@@ -547,10 +602,14 @@ class ExperimentRunner:
                     # Get deployment replicas
                     replicas = self.collector.get_deployment_replicas(self.namespace)
 
-                    for metric in metrics_to_collect:
-                        value = current_values.get(metric)
-                        if value is not None:
-                            results[metric].append({
+                    # Add all metrics to results (create new keys as needed for parametric queries)
+                    # Filter out None and NaN values (Prometheus warm-up period)
+                    for metric_key, value in current_values.items():
+                        # Skip None, NaN, and infinite values
+                        if value is not None and not (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                            if metric_key not in results:
+                                results[metric_key] = []
+                            results[metric_key].append({
                                 'timestamp': timestamp,
                                 'elapsed': elapsed,
                                 'value': value
@@ -567,7 +626,7 @@ class ExperimentRunner:
 
                     # Safe formatting with None handling - show Locust client-side metrics
                     users = current_values.get('locust_users') or 0
-                    rps = current_values.get('throughput') or 0
+                    rps = current_values.get('locust_requests_per_second') or 0
                     rt_client = current_values.get('locust_response_time_avg') or 0  # Client-side RT from Locust
 
                     print(f"  ✓ Collected at t={elapsed:.1f}s | "
@@ -689,24 +748,53 @@ class ExperimentRunner:
             'Unit': []
         }
 
-        # Define metrics to summarize with their units
+        # Start with static Locust metrics (client-side)
         metrics_config = [
             ('locust_users', 'Users', 'users'),
             ('locust_requests_per_second', 'Client RPS', 'req/s'),
             ('locust_response_time_avg', 'Client Response Time', 'ms'),
             ('locust_failure_rate', 'Client Failure Rate', '%'),
-            ('throughput', 'System Throughput', 'req/s'),
-            ('response_time_avg', 'System Response Time', 'ms'),
-            ('throughput_task1', 'Task1 Throughput', 'req/s'),
-            ('response_time_task1', 'Task1 Response Time', 'ms'),
-            ('cpu_usage_task1', 'Task1 CPU Utilization', 'cores'),
-            ('task1_replicas', 'Task1 Replicas', 'pods'),
-            ('throughput_task2', 'Task2 Throughput', 'req/s'),
-            ('response_time_task2', 'Task2 Response Time', 'ms'),
-            ('cpu_usage_task2', 'Task2 CPU Utilization', 'cores'),
-            ('task2_replicas', 'Task2 Replicas', 'pods'),
         ]
 
+        # Add system-wide metrics if present
+        if 'throughput' in df.columns:
+            metrics_config.append(('throughput', 'System Throughput', 'req/s'))
+        if 'response_time_avg' in df.columns:
+            metrics_config.append(('response_time_avg', 'System Response Time', 'ms'))
+
+        # Dynamically discover per-task metrics from deployments_map
+        # With parametric queries, columns are named:
+        #   - throughput_{deployment_key} (e.g., throughput_task1-deployment)
+        #   - response_time_{service_name} (e.g., response_time_task1-svc)
+        #   - cpu_usage_{task_name} (e.g., cpu_usage_task1)
+        #   - {task_name}_replicas (e.g., task1_replicas)
+
+        for deployment_key, deployment_info in self.deployments_map.items():
+            task_name = deployment_info['task']
+            service_name = deployment_info['service']
+            jmt_station = deployment_info.get('jmt_station', task_name)
+
+            # Throughput: check for throughput_{deployment_key}
+            throughput_col = f'throughput_{deployment_key}'
+            if throughput_col in df.columns:
+                metrics_config.append((throughput_col, f'{jmt_station} Throughput', 'req/s'))
+
+            # Response time: check for response_time_{service_name}
+            response_time_col = f'response_time_{service_name}'
+            if response_time_col in df.columns:
+                metrics_config.append((response_time_col, f'{jmt_station} Response Time', 'ms'))
+
+            # CPU usage: check for cpu_usage_{task_name}
+            cpu_col = f'cpu_usage_{task_name}'
+            if cpu_col in df.columns:
+                metrics_config.append((cpu_col, f'{jmt_station} CPU Utilization', 'cores'))
+
+            # Replicas: check for {task_name}_replicas
+            replicas_col = f'{task_name}_replicas'
+            if replicas_col in df.columns:
+                metrics_config.append((replicas_col, f'{jmt_station} Replicas', 'pods'))
+
+        # Extract statistics for all discovered metrics
         for col_name, display_name, unit in metrics_config:
             if col_name in df.columns and not df[col_name].isna().all():
                 summary_data['Metric'].append(display_name)
@@ -719,7 +807,7 @@ class ExperimentRunner:
         summary_df = pd.DataFrame(summary_data)
 
         # Save summary to CSV
-        summary_path = self.output_dir / f'experiment_{self.experiment_id}_summary.csv'
+        summary_path = self.experiment_output_dir / 'summary_statistics.csv'
         summary_df.to_csv(summary_path, index=False, float_format='%.4f')
         print(f"✅ Summary statistics saved to: {summary_path}")
 
@@ -811,7 +899,7 @@ class ExperimentRunner:
         df = df[final_columns]
 
         # Save detailed time-series to CSV
-        csv_path = self.output_dir / f'experiment_{self.experiment_id}_timeseries.csv'
+        csv_path = self.experiment_output_dir / 'metrics_timeseries.csv'
         df.to_csv(csv_path, index=False)
         print(f"✅ Detailed time-series saved to: {csv_path}")
 
@@ -908,7 +996,7 @@ class ExperimentRunner:
         plt.tight_layout()
 
         # Save plot
-        plot_path = self.output_dir / f'plots_{self.experiment_id}.png'
+        plot_path = self.experiment_output_dir / 'metrics_plots.png'
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         print(f"✅ Plots saved to: {plot_path}")
         plt.close()
@@ -946,8 +1034,10 @@ def main():
                         help='Do not cleanup deployments after test')
     parser.add_argument('--metrics-interval', type=int, default=5,
                         help='Metrics collection interval in seconds (default: 5)')
-    parser.add_argument('--validate-jmt', default=None, metavar='MAPPING_FILE',
-                        help='Validate results against JMT model using mapping config file')
+    parser.add_argument('--config', required=True,
+                        help='Path to experiment_mapping.yaml (required for parametric queries and JMT validation)')
+    parser.add_argument('--skip-jmt-validation', action='store_true',
+                        help='Skip JMT model validation (validation runs by default if JMT is available)')
 
     # Constant mode arguments
     parser.add_argument('--users', type=int,
@@ -985,7 +1075,8 @@ def main():
         locust_host=args.locust_host,
         cleanup=not args.no_cleanup,
         auto_detect_ingress=not args.no_auto_detect,
-        auto_port_forward=not args.skip_port_forward
+        auto_port_forward=not args.skip_port_forward,
+        config_path=args.config
     )
 
     print(f"\n{'='*60}")
@@ -1051,8 +1142,8 @@ def main():
             # Generate plots
             runner.generate_plots(df)
 
-            # Step 5b: JMT Validation (if requested)
-            if args.validate_jmt:
+            # Step 5b: JMT Validation (runs by default unless --skip-jmt-validation is set)
+            if not args.skip_jmt_validation:
                 if not JMT_AVAILABLE:
                     print("\n⚠️  JMT validator not available (import failed)")
                 else:
@@ -1061,8 +1152,7 @@ def main():
                     print(f"{'='*60}")
 
                     try:
-                        import yaml
-                        with open(args.validate_jmt, 'r') as f:
+                        with open(args.config, 'r') as f:
                             mapping_config = yaml.safe_load(f)
 
                         # Initialize validator
@@ -1152,8 +1242,27 @@ def main():
                             )
 
                             # Generate validation report
-                            report_path = runner.output_dir / f'jmt_validation_{runner.experiment_id}.txt'
+                            report_path = runner.experiment_output_dir / 'jmt_validation_report.txt'
                             validator.generate_validation_report(validation, str(report_path))
+
+                            # Save JMT results to CSV for what-if analysis
+                            jmt_csv_path = runner.experiment_output_dir / 'jmt_validation_results.csv'
+                            jmt_csv_data = []
+                            for task_name, station_data in validation['per_station'].items():
+                                for metric in ['throughput', 'response_time', 'utilization']:
+                                    if metric in station_data.get('theoretical', {}):
+                                        jmt_csv_data.append({
+                                            'station': station_data.get('jmt_station', ''),
+                                            'task': task_name,
+                                            'metric': metric,
+                                            'jmt_predicted': station_data['theoretical'].get(metric, 0),
+                                            'measured': station_data['measured'].get(metric, 0),
+                                            'error_pct': station_data['errors'].get(f'{metric}_error_pct', 0)
+                                        })
+                            if jmt_csv_data:
+                                jmt_csv_df = pd.DataFrame(jmt_csv_data)
+                                jmt_csv_df.to_csv(jmt_csv_path, index=False)
+                                print(f"📊 JMT results CSV saved to: {jmt_csv_path}")
                         else:
                             print("⚠️  JMT simulation returned no results")
 
@@ -1171,7 +1280,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"✅ Experiment completed successfully!")
         print(f"{'='*60}")
-        print(f"Results saved in: {runner.output_dir}")
+        print(f"Results saved in: {runner.experiment_output_dir}")
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Experiment interrupted by user")
