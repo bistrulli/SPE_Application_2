@@ -65,7 +65,8 @@ class ExperimentRunner:
         cleanup: bool = True,
         auto_detect_ingress: bool = True,
         auto_port_forward: bool = True,
-        config_path: Optional[str] = None
+        config_path: Optional[str] = None,
+        gateway_manifest_path: Optional[str] = None
     ):
         """
         Initialize the experiment runner.
@@ -80,6 +81,7 @@ class ExperimentRunner:
             auto_detect_ingress: Automatically detect Istio Ingress Gateway URL
             auto_port_forward: Automatically setup Prometheus port-forward
             config_path: Path to experiment_mapping.yaml (for parametric queries)
+            gateway_manifest_path: Path to Istio Gateway/VirtualService manifest (auto-applied if needed)
         """
         self.manifest_path = Path(manifest_path)
         self.namespace = namespace
@@ -87,6 +89,7 @@ class ExperimentRunner:
         self.output_dir = Path(output_dir)
         self.cleanup = cleanup
         self.auto_port_forward = auto_port_forward
+        self.gateway_manifest_path = Path(gateway_manifest_path) if gateway_manifest_path else None
 
         # Load experiment mapping config if provided
         self.deployments_map = {}
@@ -114,11 +117,31 @@ class ExperimentRunner:
     def _detect_istio_ingress_gateway(self) -> str:
         """
         Automatically detect the Istio Ingress Gateway URL.
+        If Gateway doesn't exist and gateway_manifest_path is configured,
+        it will automatically apply the Gateway manifest.
 
         Returns:
             The URL of the Istio Ingress Gateway
+
+        Raises:
+            RuntimeError: If Gateway is not found and cannot be applied
         """
         print("🔍 Auto-detecting Istio Ingress Gateway...")
+
+        # Ensure Minikube addons are enabled (if using Minikube)
+        try:
+            subprocess.check_output(['minikube', 'status'], timeout=5, stderr=subprocess.DEVNULL)
+            # Minikube is running, ensure addons are enabled
+            self._ensure_minikube_addons()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # Not using Minikube or minikube not available
+            pass
+
+        # Ensure Prometheus is installed
+        self._ensure_prometheus_installed()
+
+        # First, ensure Gateway exists (apply if needed)
+        self._apply_istio_gateway()
 
         try:
             # Try minikube first
@@ -190,6 +213,274 @@ class ExperimentRunner:
         except Exception as e:
             print(f"⚠️  Error detecting Ingress Gateway: {e}")
             return "http://localhost:80"
+
+    def _check_istio_gateway_exists(self) -> bool:
+        """
+        Check if Istio Gateway resource exists in the cluster.
+
+        Returns:
+            True if Gateway exists, False otherwise
+        """
+        try:
+            result = subprocess.run(
+                ['kubectl', 'get', 'gateway', '-n', self.namespace, '-o', 'name'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            return result.returncode == 0 and result.stdout.strip() != ""
+        except Exception:
+            return False
+
+    def _apply_istio_gateway(self) -> bool:
+        """
+        Apply Istio Gateway and VirtualService manifests if they don't exist.
+
+        Returns:
+            True if Gateway is available (existing or newly applied), False on error
+
+        Raises:
+            RuntimeError: If gateway manifest is not configured and gateway doesn't exist
+        """
+        # Check if Gateway already exists
+        if self._check_istio_gateway_exists():
+            print("✅ Istio Gateway already exists")
+            return True
+
+        print("⚠️  Istio Gateway not found in cluster")
+
+        # Check if gateway manifest path is configured
+        if not self.gateway_manifest_path:
+            raise RuntimeError(
+                "Istio Gateway not found and no gateway manifest configured. "
+                "Please provide --gateway-manifest parameter or apply the gateway manually:\n"
+                "  kubectl apply -f QNonK8s/istio/gateway.yaml"
+            )
+
+        # Check if manifest file exists
+        if not self.gateway_manifest_path.exists():
+            raise RuntimeError(
+                f"Gateway manifest file not found: {self.gateway_manifest_path}\n"
+                "Please provide a valid path to the Istio Gateway manifest."
+            )
+
+        print(f"📦 Applying Istio Gateway manifest: {self.gateway_manifest_path}")
+
+        try:
+            result = subprocess.run(
+                ['kubectl', 'apply', '-f', str(self.gateway_manifest_path), '-n', self.namespace],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to apply Istio Gateway manifest:\n{result.stderr}"
+                )
+
+            print(f"✅ Istio Gateway applied successfully")
+            print(result.stdout)
+
+            # Wait a moment for the gateway to be ready
+            time.sleep(2)
+
+            # Verify Gateway was created
+            if not self._check_istio_gateway_exists():
+                raise RuntimeError(
+                    "Gateway manifest applied but Gateway resource not found. "
+                    "Check that the manifest contains a valid Gateway resource."
+                )
+
+            # Verify VirtualService exists
+            try:
+                vs_result = subprocess.run(
+                    ['kubectl', 'get', 'virtualservice', '-n', self.namespace, '-o', 'name'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if vs_result.returncode == 0 and vs_result.stdout.strip():
+                    print("✅ VirtualService configured")
+                else:
+                    print("⚠️  Warning: VirtualService not found. Traffic routing may not work correctly.")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not verify VirtualService: {e}")
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timeout applying Istio Gateway manifest")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Error applying Istio Gateway: {e}")
+
+    def _ensure_minikube_addons(self):
+        """
+        Ensure required Minikube addons are enabled.
+        Re-applies addon enable commands with warning messages.
+        """
+        print("⚠️  Ensuring Minikube addons are enabled...")
+
+        addons = [
+            'istio-provisioner',
+            'istio',
+            'metrics-server'
+        ]
+
+        for addon in addons:
+            try:
+                print(f"  → Enabling {addon}...")
+                result = subprocess.run(
+                    ['minikube', 'addons', 'enable', addon],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+
+                if result.returncode != 0:
+                    print(f"    ⚠️  Warning: Failed to enable {addon}: {result.stderr.strip()}")
+                else:
+                    # Check if already enabled or newly enabled
+                    if "already enabled" in result.stdout.lower() or "is already enabled" in result.stdout.lower():
+                        print(f"    ✓ {addon} already enabled")
+                    else:
+                        print(f"    ✓ {addon} enabled")
+
+            except subprocess.TimeoutExpired:
+                print(f"    ⚠️  Warning: Timeout enabling {addon}")
+            except FileNotFoundError:
+                print(f"    ⚠️  Warning: minikube command not found, skipping addon setup")
+                return
+            except Exception as e:
+                print(f"    ⚠️  Warning: Error enabling {addon}: {e}")
+
+        # Enable Istio injection on default namespace
+        try:
+            print(f"  → Enabling Istio injection on namespace '{self.namespace}'...")
+            result = subprocess.run(
+                ['kubectl', 'label', 'namespace', self.namespace,
+                 'istio-injection=enabled', '--overwrite'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                print(f"    ✓ Istio injection enabled on namespace '{self.namespace}'")
+            else:
+                print(f"    ⚠️  Warning: Failed to enable Istio injection: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"    ⚠️  Warning: Error enabling Istio injection: {e}")
+
+        print("✅ Minikube addons configured")
+
+    def _ensure_prometheus_installed(self):
+        """
+        Ensure Prometheus (kube-prometheus-stack) is installed via Helm.
+        If not installed, installs it with Istio integration.
+        """
+        print("🔍 Checking Prometheus installation...")
+
+        try:
+            # Check if prometheus release exists in monitoring namespace
+            result = subprocess.run(
+                ['helm', 'status', 'prometheus', '-n', 'monitoring'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                print("✅ Prometheus release already installed")
+                return True
+
+            # Release doesn't exist, install it
+            print("⚠️  Prometheus not found, installing kube-prometheus-stack...")
+
+            # Check if values file exists
+            values_file = Path("QNonK8s/istio/prometheus-istio-values.yaml")
+            if not values_file.exists():
+                print(f"❌ Values file not found: {values_file}")
+                raise RuntimeError(
+                    f"Prometheus values file not found: {values_file}\n"
+                    "Please ensure QNonK8s/istio/prometheus-istio-values.yaml exists."
+                )
+
+            # Install prometheus
+            install_cmd = [
+                'helm', 'install', 'prometheus',
+                'prometheus-community/kube-prometheus-stack',
+                '--namespace', 'monitoring',
+                '-f', str(values_file),
+                '--create-namespace'
+            ]
+
+            print(f"  → Running: {' '.join(install_cmd)}")
+
+            install_result = subprocess.run(
+                install_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutes timeout for installation
+            )
+
+            if install_result.returncode != 0:
+                # Check if it's because repo is not added
+                if "failed to fetch" in install_result.stderr.lower() or "not found" in install_result.stderr.lower():
+                    print("  ⚠️  Helm repo not found, adding prometheus-community repo...")
+
+                    # Add helm repo
+                    add_repo_result = subprocess.run(
+                        ['helm', 'repo', 'add', 'prometheus-community',
+                         'https://prometheus-community.github.io/helm-charts'],
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+
+                    if add_repo_result.returncode != 0:
+                        raise RuntimeError(f"Failed to add Helm repo: {add_repo_result.stderr}")
+
+                    print("  ✓ Helm repo added")
+
+                    # Update repos
+                    subprocess.run(['helm', 'repo', 'update'], capture_output=True, timeout=60)
+                    print("  ✓ Helm repos updated")
+
+                    # Retry installation
+                    install_result = subprocess.run(
+                        install_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
+
+                    if install_result.returncode != 0:
+                        raise RuntimeError(f"Failed to install Prometheus:\n{install_result.stderr}")
+                else:
+                    raise RuntimeError(f"Failed to install Prometheus:\n{install_result.stderr}")
+
+            print("✅ Prometheus installed successfully")
+            print(install_result.stdout)
+
+            # Wait for Prometheus pods to be ready
+            print("  ⏳ Waiting for Prometheus pods to be ready...")
+            time.sleep(10)
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timeout while installing Prometheus")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Helm command not found. Please install Helm:\n"
+                "  https://helm.sh/docs/intro/install/"
+            )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Error ensuring Prometheus installation: {e}")
 
     def _load_deployment_mapping(self, config_path: str) -> Dict[str, Dict]:
         """
@@ -1036,6 +1327,8 @@ def main():
                         help='Metrics collection interval in seconds (default: 5)')
     parser.add_argument('--config', required=True,
                         help='Path to experiment_mapping.yaml (required for parametric queries and JMT validation)')
+    parser.add_argument('--gateway-manifest', default=None,
+                        help='Path to Istio Gateway/VirtualService manifest (auto-applied if Gateway not found)')
     parser.add_argument('--skip-jmt-validation', action='store_true',
                         help='Skip JMT model validation (validation runs by default if JMT is available)')
 
@@ -1076,7 +1369,8 @@ def main():
         cleanup=not args.no_cleanup,
         auto_detect_ingress=not args.no_auto_detect,
         auto_port_forward=not args.skip_port_forward,
-        config_path=args.config
+        config_path=args.config,
+        gateway_manifest_path=args.gateway_manifest
     )
 
     print(f"\n{'='*60}")

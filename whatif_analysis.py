@@ -44,7 +44,8 @@ class WhatIfAnalysis:
         duration: int,
         mode: str = "constant",
         output_dir: str = "results",
-        cooldown: int = 10
+        cooldown: int = 10,
+        gateway_manifest: str = None
     ):
         """
         Initialize what-if analysis.
@@ -58,6 +59,7 @@ class WhatIfAnalysis:
             mode: Test mode (constant or trace)
             output_dir: Base output directory
             cooldown: Seconds to wait between experiments (default: 10)
+            gateway_manifest: Path to Istio Gateway manifest (auto-applied if needed)
         """
         self.users_range = sorted(users_range)
         self.manifest = manifest
@@ -67,6 +69,7 @@ class WhatIfAnalysis:
         self.mode = mode
         self.base_output_dir = Path(output_dir)
         self.cooldown = cooldown
+        self.gateway_manifest = gateway_manifest
 
         # Track currently running experiment process
         self.current_process = None
@@ -148,6 +151,10 @@ class WhatIfAnalysis:
             '--think-time', str(self.think_time),
             '--duration', str(self.duration)
         ]
+
+        # Add gateway manifest if configured
+        if self.gateway_manifest:
+            cmd.extend(['--gateway-manifest', self.gateway_manifest])
 
         print(f"Command: {' '.join(cmd)}\n")
 
@@ -610,6 +617,8 @@ def main():
                         help='Base output directory (default: results)')
     parser.add_argument('--cooldown', type=int, default=10,
                         help='Seconds to wait between experiments (default: 10)')
+    parser.add_argument('--gateway-manifest', default=None,
+                        help='Path to Istio Gateway/VirtualService manifest (auto-applied if not found)')
 
     args = parser.parse_args()
 
@@ -632,7 +641,8 @@ def main():
         duration=args.duration,
         mode=args.mode,
         output_dir=args.output_dir,
-        cooldown=args.cooldown
+        cooldown=args.cooldown,
+        gateway_manifest=args.gateway_manifest
     )
 
     # Run all experiments

@@ -1,0 +1,41 @@
+============================================================
+JMT Model Validation Report
+============================================================
+
+## Per-Station Comparison
+------------------------------------------------------------
+
+### task1 <-> Tier1
+
+  Metric          | Measured      | Theoretical   | Error %
+  --------------------------------------------------------
+  Throughput      |         0.00  |         0.83  |   0.00%
+  Response Time   |       0.0000s |       0.1000s |   0.00%
+  CPU Utilization |       0.0008  |       0.0833  |  98.99%
+
+### task2 <-> Tier2
+
+  Metric          | Measured      | Theoretical   | Error %
+  --------------------------------------------------------
+  Throughput      |         0.00  |         0.83  |   0.00%
+  Response Time   |       0.0000s |       0.1000s |   0.00%
+  CPU Utilization |       0.0124  |       0.0833  |  85.15%
+
+## System-Wide Metrics
+------------------------------------------------------------
+  system_response_time: 0.0494 s
+
+## Average Validation Errors
+------------------------------------------------------------
+  avg_utilization_error_pct: 92.07%
+
+## Summary
+------------------------------------------------------------
+  Number of stations: 2
+  System throughput: 0.00 req/s
+  System response time: 0.0494 s
+  Avg throughput error: 0.00%
+  Avg response time error: 0.00%
+  Avg utilization error: 92.07%
+
+  *** OVERALL ASSESSMENT: POOR ***

@@ -1,0 +1,9 @@
+Metric,Mean,Std Dev,Min,Max,Unit
+Users,1.0000,0.0000,1.0000,1.0000,users
+Client RPS,1.0033,0.2810,0.4000,1.5000,req/s
+Client Response Time,52.5487,1.9416,50.1505,62.9646,ms
+Client Failure Rate,0.9931,0.0225,0.8956,1.0000,%
+Tier1 CPU Utilization,0.0020,0.0067,0.0003,0.0470,cores
+Tier1 Replicas,1.0000,0.0000,1.0000,1.0000,pods
+Tier2 CPU Utilization,0.0024,0.0079,0.0004,0.0565,cores
+Tier2 Replicas,1.0000,0.0000,1.0000,1.0000,pods

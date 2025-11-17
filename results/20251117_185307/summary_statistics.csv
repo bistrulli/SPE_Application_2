@@ -1,0 +1,13 @@
+Metric,Mean,Std Dev,Min,Max,Unit
+Users,5.0000,0.0000,5.0000,5.0000,users
+Client RPS,4.2983,0.5540,3.2000,5.4000,req/s
+Client Response Time,131.8628,11.4027,92.0238,147.7210,ms
+Client Failure Rate,0.0000,0.0000,0.0000,0.0000,%
+Tier1 Throughput,3.9267,0.9017,0.5667,4.9000,req/s
+Tier1 Response Time,0.1361,0.0223,0.0910,0.1775,ms
+Tier1 CPU Utilization,0.3754,0.1219,0.0249,0.5295,cores
+Tier1 Replicas,1.0000,0.0000,1.0000,1.0000,pods
+Tier2 Throughput,3.9794,0.8936,0.5667,4.6667,req/s
+Tier2 Response Time,0.1396,0.0200,0.1022,0.1710,ms
+Tier2 CPU Utilization,0.3671,0.0908,0.0235,0.4790,cores
+Tier2 Replicas,1.0000,0.0000,1.0000,1.0000,pods
