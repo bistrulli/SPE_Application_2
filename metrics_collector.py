@@ -11,9 +11,13 @@ import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+# Type checking imports to avoid circular dependencies
+if TYPE_CHECKING:
+    from kubernetes import client
 
 
 @dataclass
@@ -76,7 +80,7 @@ class PrometheusCollector:
         'locust_failure_rate': 'locust_failure_rate',
     }
 
-    def __init__(self, prometheus_url: str = "http://localhost:9090", custom_queries: Optional[Dict[str, str]] = None, locust_exporter_url: str = "http://localhost:9646"):
+    def __init__(self, prometheus_url: str = "http://localhost:9090", custom_queries: Optional[Dict[str, str]] = None, locust_exporter_url: str = "http://localhost:9646", k8s_client = None):
         """
         Initialize Prometheus collector.
 
@@ -84,11 +88,13 @@ class PrometheusCollector:
             prometheus_url: Base URL of Prometheus server
             custom_queries: Optional custom queries to override defaults (for K8s/Istio)
             locust_exporter_url: URL of Locust Prometheus exporter (for direct reading)
+            k8s_client: Optional KubernetesClientManager instance for API calls
         """
         self.base_url = prometheus_url.rstrip('/')
         self.locust_exporter_url = locust_exporter_url.rstrip('/')
         self.session = requests.Session()
         self._mm1_container_id = None
+        self.k8s_client = k8s_client
 
         # Use custom queries if provided, otherwise use defaults
         if custom_queries:
@@ -531,7 +537,7 @@ class PrometheusCollector:
     def get_deployment_replicas(self, namespace: str = "default") -> Dict[str, int]:
         """
         Get current replica counts for all deployments in a namespace.
-        Uses kubectl to query deployment status.
+        Uses Kubernetes API if client is available, otherwise falls back to kubectl.
 
         Args:
             namespace: Kubernetes namespace to query
@@ -539,6 +545,15 @@ class PrometheusCollector:
         Returns:
             Dictionary mapping deployment names to replica counts
         """
+        # Try using Kubernetes API client first (preferred method)
+        if self.k8s_client:
+            try:
+                return self.k8s_client.get_deployment_replicas(namespace)
+            except Exception as e:
+                print(f"Warning: Failed to get deployments via API, falling back to kubectl: {e}")
+                # Fall through to subprocess method
+
+        # Fallback to subprocess method for backwards compatibility
         try:
             import subprocess
             import json

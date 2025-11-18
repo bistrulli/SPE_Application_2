@@ -1,7 +1,0 @@
-station,task,metric,jmt_predicted,measured,error_pct
-Tier1,task1,throughput,0.8333333333333333,0.0,0.0
-Tier1,task1,response_time,0.1,0.0,0.0
-Tier1,task1,utilization,0.08333333333333333,0.001981819708378145,97.62181634994622
-Tier2,task2,throughput,0.8333333333333333,0.0,0.0
-Tier2,task2,response_time,0.1,0.0,0.0
-Tier2,task2,utilization,0.08333333333333333,0.0024052642502621277,97.11368289968544

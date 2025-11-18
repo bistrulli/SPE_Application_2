@@ -39,6 +39,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 
+# Kubernetes Python client
+from kubernetes import client, config, watch
+from kubernetes.client.rest import ApiException
+from kubernetes.config.config_exception import ConfigException
+
 # Import the metrics collector
 from metrics_collector import PrometheusCollector
 
@@ -48,6 +53,539 @@ try:
     JMT_AVAILABLE = True
 except ImportError:
     JMT_AVAILABLE = False
+
+
+class KubernetesClientManager:
+    """
+    Manager for Kubernetes Python client with connection verification.
+    """
+
+    def __init__(self, namespace: str = "default"):
+        """
+        Initialize Kubernetes client and verify cluster connection.
+
+        Args:
+            namespace: Default Kubernetes namespace
+
+        Raises:
+            SystemExit: If cannot connect to cluster
+        """
+        self.namespace = namespace
+        self.v1 = None
+        self.apps_v1 = None
+        self.custom_api = None
+
+        try:
+            # Load kubeconfig
+            config.load_kube_config()
+
+            # Initialize API clients
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.custom_api = client.CustomObjectsApi()
+
+            # Verify connection
+            self._verify_connection()
+
+        except ConfigException as e:
+            print("❌ ERROR: Unable to connect to Kubernetes cluster.")
+            print("   Please verify that kubectl is configured correctly:")
+            print("   - Run: kubectl cluster-info")
+            print(f"   Details: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ ERROR: Unexpected error during Kubernetes client initialization: {e}")
+            sys.exit(1)
+
+    def _verify_connection(self):
+        """
+        Verify connection to Kubernetes cluster.
+
+        Raises:
+            SystemExit: If connection fails or permissions insufficient
+        """
+        try:
+            # Try to list namespaces (basic permission check)
+            self.v1.list_namespace(limit=1)
+            print("✅ Kubernetes cluster connection verified")
+        except ApiException as e:
+            if e.status == 403:
+                print(f"❌ ERROR: Insufficient permissions on Kubernetes cluster")
+                print(f"   The service account does not have permission to access the required resources.")
+                print(f"   Details: {e.reason}")
+            else:
+                print(f"❌ ERROR: Unable to access Kubernetes cluster")
+                print(f"   HTTP Status: {e.status}")
+                print(f"   Details: {e.reason}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ ERROR: Cluster connection verification failed: {e}")
+            sys.exit(1)
+
+    def wait_for_deployments_ready(self, namespace: str, timeout: int = 120) -> bool:
+        """
+        Wait for all deployments in namespace to be ready using Watch API.
+
+        Args:
+            namespace: Kubernetes namespace
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if all deployments ready, False on timeout
+        """
+        print(f"⏳ Waiting for deployments to be ready (timeout: {timeout}s)...")
+
+        try:
+            start_time = time.time()
+            w = watch.Watch()
+
+            # Get list of deployments first
+            deployments = self.apps_v1.list_namespaced_deployment(namespace=namespace)
+            if not deployments.items:
+                print("  ℹ️  No deployments found in namespace")
+                return True
+
+            deployment_names = {d.metadata.name for d in deployments.items}
+            ready_deployments = set()
+
+            print(f"  📋 Found {len(deployment_names)} deployments: {', '.join(deployment_names)}")
+
+            # Watch deployment events
+            for event in w.stream(
+                self.apps_v1.list_namespaced_deployment,
+                namespace=namespace,
+                timeout_seconds=timeout
+            ):
+                deployment = event['object']
+                name = deployment.metadata.name
+
+                # Check if deployment is ready
+                if (deployment.status.ready_replicas is not None and
+                    deployment.status.replicas is not None and
+                    deployment.status.ready_replicas == deployment.status.replicas and
+                    deployment.status.replicas > 0):
+
+                    if name not in ready_deployments:
+                        ready_deployments.add(name)
+                        print(f"  ✓ Deployment '{name}' ready ({deployment.status.ready_replicas}/{deployment.status.replicas} replicas)")
+
+                # Check if all deployments are ready
+                if deployment_names.issubset(ready_deployments):
+                    w.stop()
+                    print("✅ All deployments are ready")
+                    return True
+
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    w.stop()
+                    missing = deployment_names - ready_deployments
+                    print(f"⚠️  Timeout: Deployments not ready: {', '.join(missing)}")
+                    return False
+
+            # Check final status after watch ends
+            for name in deployment_names:
+                if name not in ready_deployments:
+                    print(f"⚠️  Deployment '{name}' not ready after {timeout}s")
+
+            return len(ready_deployments) == len(deployment_names)
+
+        except ApiException as e:
+            print(f"⚠️  API error while waiting for deployments: {e.reason}")
+            return False
+        except Exception as e:
+            print(f"⚠️  Error waiting for deployments: {e}")
+            return False
+
+    def apply_manifest_from_file(self, manifest_path: str, namespace: str) -> bool:
+        """
+        Apply Kubernetes manifest from YAML file.
+
+        Args:
+            manifest_path: Path to manifest file
+            namespace: Target namespace
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with open(manifest_path, 'r') as f:
+                documents = list(yaml.safe_load_all(f))
+
+            print(f"📦 Applying {len(documents)} resources from manifest...")
+
+            for doc in documents:
+                if not doc:
+                    continue
+
+                kind = doc.get('kind', '')
+                name = doc.get('metadata', {}).get('name', 'unknown')
+
+                try:
+                    if kind == 'Deployment':
+                        self._apply_deployment(doc, namespace)
+                        print(f"  ✓ Deployment: {name}")
+                    elif kind == 'Service':
+                        self._apply_service(doc, namespace)
+                        print(f"  ✓ Service: {name}")
+                    elif kind in ['DestinationRule', 'Gateway', 'VirtualService']:
+                        # Extract group and version from the document itself
+                        group, version = self._parse_api_version(doc)
+                        plural = self._kind_to_plural(kind)
+                        self._apply_custom_resource(doc, namespace, plural, group, version)
+                        print(f"  ✓ {kind}: {name}")
+                    else:
+                        print(f"  ⚠️  Skipping unsupported resource type: {kind} ({name})")
+
+                except ApiException as e:
+                    if e.status == 409:  # Already exists
+                        print(f"  ℹ️  {kind} '{name}' already exists, updating...")
+                        # Try to update/patch the resource
+                        try:
+                            if kind == 'Deployment':
+                                self.apps_v1.patch_namespaced_deployment(name, namespace, doc)
+                            elif kind == 'Service':
+                                self.v1.patch_namespaced_service(name, namespace, doc)
+                            else:
+                                # For custom resources, use patch
+                                group, version = self._parse_api_version(doc)
+                                plural = self._kind_to_plural(kind)
+                                self.custom_api.patch_namespaced_custom_object(
+                                    group, version, namespace, plural, name, doc
+                                )
+                            print(f"  ✓ Updated {kind}: {name}")
+                        except Exception as patch_error:
+                            print(f"  ⚠️  Failed to update {kind} '{name}': {patch_error}")
+                    else:
+                        raise
+
+            return True
+
+        except FileNotFoundError:
+            print(f"❌ Manifest file not found: {manifest_path}")
+            return False
+        except Exception as e:
+            print(f"❌ Error applying manifest: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _apply_deployment(self, doc: Dict, namespace: str):
+        """Apply Deployment resource."""
+        doc['metadata']['namespace'] = namespace
+        self.apps_v1.create_namespaced_deployment(namespace, doc)
+
+    def _apply_service(self, doc: Dict, namespace: str):
+        """Apply Service resource."""
+        doc['metadata']['namespace'] = namespace
+        self.v1.create_namespaced_service(namespace, doc)
+
+    def _apply_custom_resource(self, doc: Dict, namespace: str, plural: str, group: str, version: str):
+        """Apply custom resource (CRD)."""
+        doc['metadata']['namespace'] = namespace
+        self.custom_api.create_namespaced_custom_object(
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            body=doc
+        )
+
+    def _parse_api_version(self, doc: Dict) -> tuple:
+        """Parse apiVersion into (group, version)."""
+        api_version = doc.get('apiVersion', '')
+        if '/' in api_version:
+            group, version = api_version.split('/', 1)
+            return group, version
+        return '', api_version
+
+    def _kind_to_plural(self, kind: str) -> str:
+        """Convert Kind to plural form (simplified)."""
+        plurals = {
+            'Gateway': 'gateways',
+            'VirtualService': 'virtualservices',
+            'DestinationRule': 'destinationrules',
+        }
+        return plurals.get(kind, kind.lower() + 's')
+
+    def delete_manifest_from_file(self, manifest_path: str, namespace: str) -> bool:
+        """
+        Delete resources defined in manifest file.
+
+        Args:
+            manifest_path: Path to manifest file
+            namespace: Target namespace
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with open(manifest_path, 'r') as f:
+                documents = list(yaml.safe_load_all(f))
+
+            print(f"🧹 Deleting {len(documents)} resources from manifest...")
+
+            for doc in documents:
+                if not doc:
+                    continue
+
+                kind = doc.get('kind', '')
+                name = doc.get('metadata', {}).get('name', 'unknown')
+
+                try:
+                    if kind == 'Deployment':
+                        self.apps_v1.delete_namespaced_deployment(
+                            name, namespace,
+                            body=client.V1DeleteOptions(propagation_policy='Foreground')
+                        )
+                        print(f"  ✓ Deleted Deployment: {name}")
+                    elif kind == 'Service':
+                        self.v1.delete_namespaced_service(name, namespace)
+                        print(f"  ✓ Deleted Service: {name}")
+                    elif kind in ['DestinationRule', 'Gateway', 'VirtualService']:
+                        group, version = self._parse_api_version(doc)
+                        plural = self._kind_to_plural(kind)
+                        self.custom_api.delete_namespaced_custom_object(
+                            group, version, namespace, plural, name
+                        )
+                        print(f"  ✓ Deleted {kind}: {name}")
+
+                except ApiException as e:
+                    if e.status == 404:
+                        print(f"  ℹ️  {kind} '{name}' not found (already deleted?)")
+                    else:
+                        print(f"  ⚠️  Failed to delete {kind} '{name}': {e.reason}")
+                except Exception as e:
+                    print(f"  ⚠️  Error deleting {kind} '{name}': {e}")
+
+            return True
+
+        except FileNotFoundError:
+            print(f"❌ Manifest file not found: {manifest_path}")
+            return False
+        except Exception as e:
+            print(f"⚠️  Error during cleanup: {e}")
+            return False
+
+    def get_service(self, name: str, namespace: str) -> Optional[client.V1Service]:
+        """
+        Get service by name.
+
+        Args:
+            name: Service name
+            namespace: Namespace
+
+        Returns:
+            Service object or None if not found
+        """
+        try:
+            return self.v1.read_namespaced_service(name, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def get_first_node_ip(self) -> Optional[str]:
+        """
+        Get internal IP of first node in cluster.
+
+        Returns:
+            Node IP or None if not found
+        """
+        try:
+            nodes = self.v1.list_node()
+            if nodes.items:
+                node = nodes.items[0]
+                for address in node.status.addresses:
+                    if address.type == "InternalIP":
+                        return address.address
+        except Exception:
+            pass
+        return None
+
+    def check_gateway_exists(self, namespace: str) -> bool:
+        """
+        Check if Istio Gateway resource exists.
+
+        Args:
+            namespace: Namespace to check
+
+        Returns:
+            True if Gateway exists, False otherwise
+        """
+        try:
+            gateways = self.custom_api.list_namespaced_custom_object(
+                group='networking.istio.io',
+                version='v1alpha3',
+                namespace=namespace,
+                plural='gateways'
+            )
+            return len(gateways.get('items', [])) > 0
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            return False
+        except Exception:
+            return False
+
+    def check_virtualservice_exists(self, namespace: str) -> bool:
+        """
+        Check if Istio VirtualService resource exists.
+
+        Args:
+            namespace: Namespace to check
+
+        Returns:
+            True if VirtualService exists, False otherwise
+        """
+        try:
+            vs_list = self.custom_api.list_namespaced_custom_object(
+                group='networking.istio.io',
+                version='v1alpha3',
+                namespace=namespace,
+                plural='virtualservices'
+            )
+            return len(vs_list.get('items', [])) > 0
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            return False
+        except Exception:
+            return False
+
+    def patch_namespace_labels(self, namespace: str, labels: Dict[str, str]) -> bool:
+        """
+        Patch namespace labels (e.g., for Istio injection).
+
+        Args:
+            namespace: Namespace to patch
+            labels: Labels to set
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            body = {
+                'metadata': {
+                    'labels': labels
+                }
+            }
+            self.v1.patch_namespace(namespace, body)
+            return True
+        except ApiException as e:
+            print(f"⚠️  Failed to patch namespace labels: {e.reason}")
+            return False
+        except Exception as e:
+            print(f"⚠️  Error patching namespace: {e}")
+            return False
+
+    def get_deployment_replicas(self, namespace: str) -> Dict[str, Dict[str, int]]:
+        """
+        Get replica counts for all deployments in namespace.
+
+        Args:
+            namespace: Kubernetes namespace
+
+        Returns:
+            Dict mapping deployment names to replica counts
+        """
+        try:
+            deployments = self.apps_v1.list_namespaced_deployment(namespace=namespace)
+            replica_info = {}
+
+            for deployment in deployments.items:
+                name = deployment.metadata.name
+                replica_info[name] = {
+                    'replicas': deployment.status.replicas or 0,
+                    'ready': deployment.status.ready_replicas or 0,
+                    'available': deployment.status.available_replicas or 0
+                }
+
+            return replica_info
+
+        except ApiException as e:
+            print(f"⚠️  Error getting deployment replicas: {e.reason}")
+            return {}
+        except Exception as e:
+            print(f"⚠️  Error: {e}")
+            return {}
+
+    def wait_for_pods_ready(self, namespace: str, label_selector: str = None, timeout: int = 600) -> bool:
+        """
+        Wait for all pods in namespace (optionally filtered by label) to be ready using Watch API.
+
+        Args:
+            namespace: Kubernetes namespace
+            label_selector: Optional label selector (e.g., "app=prometheus")
+            timeout: Maximum time to wait in seconds (default: 600s = 10 minutes)
+
+        Returns:
+            True if all pods ready, False on timeout
+        """
+        print(f"⏳ Waiting for pods in namespace '{namespace}' to be ready (timeout: {timeout}s)...")
+        if label_selector:
+            print(f"   Label selector: {label_selector}")
+
+        try:
+            start_time = time.time()
+            w = watch.Watch()
+
+            # Get initial list of pods
+            if label_selector:
+                pods = self.v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+            else:
+                pods = self.v1.list_namespaced_pod(namespace=namespace)
+
+            if not pods.items:
+                print(f"  ℹ️  No pods found in namespace '{namespace}'")
+                return True
+
+            pod_names = {p.metadata.name for p in pods.items}
+            ready_pods = set()
+
+            print(f"  📋 Found {len(pod_names)} pods")
+
+            # Watch pod events
+            for event in w.stream(
+                self.v1.list_namespaced_pod,
+                namespace=namespace,
+                label_selector=label_selector,
+                timeout_seconds=timeout
+            ):
+                pod = event['object']
+                name = pod.metadata.name
+
+                # Check if pod is ready
+                if pod.status.conditions:
+                    for condition in pod.status.conditions:
+                        if condition.type == 'Ready' and condition.status == 'True':
+                            if name not in ready_pods:
+                                ready_pods.add(name)
+                                print(f"  ✓ Pod '{name}' ready")
+                            break
+
+                # Check if all pods are ready
+                if pod_names.issubset(ready_pods):
+                    w.stop()
+                    print(f"✅ All {len(pod_names)} pods are ready")
+                    return True
+
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    w.stop()
+                    missing = pod_names - ready_pods
+                    print(f"⚠️  Timeout after {timeout}s: {len(missing)} pods not ready: {', '.join(list(missing)[:5])}")
+                    return False
+
+            # Final check after watch ends
+            return len(ready_pods) == len(pod_names)
+
+        except ApiException as e:
+            print(f"⚠️  API error while waiting for pods: {e.reason}")
+            return False
+        except Exception as e:
+            print(f"⚠️  Error waiting for pods: {e}")
+            return False
 
 
 class ExperimentRunner:
@@ -90,6 +628,9 @@ class ExperimentRunner:
         self.cleanup = cleanup
         self.auto_port_forward = auto_port_forward
         self.gateway_manifest_path = Path(gateway_manifest_path) if gateway_manifest_path else None
+
+        # Initialize Kubernetes client
+        self.k8s_client = KubernetesClientManager(namespace=namespace)
 
         # Load experiment mapping config if provided
         self.deployments_map = {}
@@ -153,58 +694,42 @@ class ExperimentRunner:
                     stderr=subprocess.DEVNULL
                 ).strip()
 
-                # Get NodePort
-                nodeport = subprocess.check_output(
-                    ['kubectl', 'get', 'svc', 'istio-ingressgateway', '-n', 'istio-system',
-                     '-o', 'jsonpath={.spec.ports[?(@.name=="http2")].nodePort}'],
-                    text=True,
-                    timeout=10
-                ).strip()
-
-                if minikube_ip and nodeport:
-                    url = f"http://{minikube_ip}:{nodeport}"
-                    print(f"✅ Detected Minikube Ingress Gateway: {url}")
-                    return url
+                # Get NodePort using API
+                svc = self.k8s_client.get_service('istio-ingressgateway', 'istio-system')
+                if svc and svc.spec.ports:
+                    for port in svc.spec.ports:
+                        if port.name == 'http2' and port.node_port:
+                            url = f"http://{minikube_ip}:{port.node_port}"
+                            print(f"✅ Detected Minikube Ingress Gateway: {url}")
+                            return url
             except (subprocess.SubprocessError, FileNotFoundError):
                 pass
 
             # Try LoadBalancer external IP
             try:
-                external_ip = subprocess.check_output(
-                    ['kubectl', 'get', 'svc', 'istio-ingressgateway', '-n', 'istio-system',
-                     '-o', 'jsonpath={.status.loadBalancer.ingress[0].ip}'],
-                    text=True,
-                    timeout=10
-                ).strip()
-
-                if external_ip:
-                    url = f"http://{external_ip}"
-                    print(f"✅ Detected LoadBalancer Ingress Gateway: {url}")
-                    return url
-            except subprocess.SubprocessError:
+                svc = self.k8s_client.get_service('istio-ingressgateway', 'istio-system')
+                if svc and svc.status.load_balancer.ingress:
+                    ingress = svc.status.load_balancer.ingress[0]
+                    external_ip = ingress.ip or ingress.hostname
+                    if external_ip:
+                        url = f"http://{external_ip}"
+                        print(f"✅ Detected LoadBalancer Ingress Gateway: {url}")
+                        return url
+            except Exception:
                 pass
 
             # Try NodePort with first node IP
             try:
-                node_ip = subprocess.check_output(
-                    ['kubectl', 'get', 'nodes', '-o',
-                     'jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}'],
-                    text=True,
-                    timeout=10
-                ).strip()
+                node_ip = self.k8s_client.get_first_node_ip()
+                svc = self.k8s_client.get_service('istio-ingressgateway', 'istio-system')
 
-                nodeport = subprocess.check_output(
-                    ['kubectl', 'get', 'svc', 'istio-ingressgateway', '-n', 'istio-system',
-                     '-o', 'jsonpath={.spec.ports[?(@.name=="http2")].nodePort}'],
-                    text=True,
-                    timeout=10
-                ).strip()
-
-                if node_ip and nodeport:
-                    url = f"http://{node_ip}:{nodeport}"
-                    print(f"✅ Detected NodePort Ingress Gateway: {url}")
-                    return url
-            except subprocess.SubprocessError:
+                if node_ip and svc and svc.spec.ports:
+                    for port in svc.spec.ports:
+                        if port.name == 'http2' and port.node_port:
+                            url = f"http://{node_ip}:{port.node_port}"
+                            print(f"✅ Detected NodePort Ingress Gateway: {url}")
+                            return url
+            except Exception:
                 pass
 
             print("⚠️  Could not auto-detect Ingress Gateway, using default localhost:80")
@@ -221,16 +746,7 @@ class ExperimentRunner:
         Returns:
             True if Gateway exists, False otherwise
         """
-        try:
-            result = subprocess.run(
-                ['kubectl', 'get', 'gateway', '-n', self.namespace, '-o', 'name'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            return result.returncode == 0 and result.stdout.strip() != ""
-        except Exception:
-            return False
+        return self.k8s_client.check_gateway_exists(self.namespace)
 
     def _apply_istio_gateway(self) -> bool:
         """
@@ -267,23 +783,14 @@ class ExperimentRunner:
         print(f"📦 Applying Istio Gateway manifest: {self.gateway_manifest_path}")
 
         try:
-            result = subprocess.run(
-                ['kubectl', 'apply', '-f', str(self.gateway_manifest_path), '-n', self.namespace],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to apply Istio Gateway manifest:\n{result.stderr}"
-                )
+            # Apply manifest using K8s API
+            if not self.k8s_client.apply_manifest_from_file(str(self.gateway_manifest_path), self.namespace):
+                raise RuntimeError("Failed to apply Istio Gateway manifest")
 
             print(f"✅ Istio Gateway applied successfully")
-            print(result.stdout)
 
-            # Wait a moment for the gateway to be ready
-            time.sleep(2)
+            # Give Gateway a moment to be registered (reduced from 2s to 1s since we're using API)
+            time.sleep(1)
 
             # Verify Gateway was created
             if not self._check_istio_gateway_exists():
@@ -293,24 +800,13 @@ class ExperimentRunner:
                 )
 
             # Verify VirtualService exists
-            try:
-                vs_result = subprocess.run(
-                    ['kubectl', 'get', 'virtualservice', '-n', self.namespace, '-o', 'name'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if vs_result.returncode == 0 and vs_result.stdout.strip():
-                    print("✅ VirtualService configured")
-                else:
-                    print("⚠️  Warning: VirtualService not found. Traffic routing may not work correctly.")
-            except Exception as e:
-                print(f"⚠️  Warning: Could not verify VirtualService: {e}")
+            if self.k8s_client.check_virtualservice_exists(self.namespace):
+                print("✅ VirtualService configured")
+            else:
+                print("⚠️  Warning: VirtualService not found. Traffic routing may not work correctly.")
 
             return True
 
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Timeout applying Istio Gateway manifest")
         except RuntimeError:
             raise
         except Exception as e:
@@ -356,24 +852,20 @@ class ExperimentRunner:
             except Exception as e:
                 print(f"    ⚠️  Warning: Error enabling {addon}: {e}")
 
-        # Enable Istio injection on default namespace
-        try:
-            print(f"  → Enabling Istio injection on namespace '{self.namespace}'...")
-            result = subprocess.run(
-                ['kubectl', 'label', 'namespace', self.namespace,
-                 'istio-injection=enabled', '--overwrite'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            if result.returncode == 0:
-                print(f"    ✓ Istio injection enabled on namespace '{self.namespace}'")
-            else:
-                print(f"    ⚠️  Warning: Failed to enable Istio injection: {result.stderr.strip()}")
-        except Exception as e:
-            print(f"    ⚠️  Warning: Error enabling Istio injection: {e}")
+        # Enable Istio injection on namespace using API
+        print(f"  → Enabling Istio injection on namespace '{self.namespace}'...")
+        if self.k8s_client.patch_namespace_labels(self.namespace, {'istio-injection': 'enabled'}):
+            print(f"    ✓ Istio injection enabled on namespace '{self.namespace}'")
+        else:
+            print(f"    ⚠️  Warning: Failed to enable Istio injection")
 
         print("✅ Minikube addons configured")
+
+        # Wait for Istio pods to be ready
+        print("\n⏳ Waiting for Istio pods to be ready...")
+        if not self.k8s_client.wait_for_pods_ready(namespace='istio-system', timeout=600):
+            print("⚠️  Warning: Some Istio pods may not be ready yet")
+            print("   Continuing anyway - service mesh may take time to initialize")
 
     def _ensure_prometheus_installed(self):
         """
@@ -464,9 +956,11 @@ class ExperimentRunner:
             print("✅ Prometheus installed successfully")
             print(install_result.stdout)
 
-            # Wait for Prometheus pods to be ready
-            print("  ⏳ Waiting for Prometheus pods to be ready...")
-            time.sleep(10)
+            # Wait for Prometheus pods to be ready using Watch API
+            print("\n")
+            if not self.k8s_client.wait_for_pods_ready(namespace='monitoring', timeout=600):
+                print("⚠️  Warning: Some Prometheus pods may not be ready yet")
+                print("   Continuing anyway - metrics collection may be delayed")
 
             return True
 
@@ -527,9 +1021,41 @@ class ExperimentRunner:
             traceback.print_exc()
             return {}
 
+    def _find_prometheus_service(self) -> tuple:
+        """
+        Auto-discover Prometheus service in the cluster.
+
+        Returns:
+            Tuple of (namespace, service_name, port) or (None, None, None) if not found
+        """
+        # Try common namespaces and service name patterns
+        search_patterns = [
+            ('monitoring', ['prometheus-kube-prometheus-prometheus', 'prometheus-server', 'prometheus-operated', 'prometheus']),
+            ('istio-system', ['prometheus']),
+            ('default', ['prometheus']),
+        ]
+
+        for namespace, service_names in search_patterns:
+            try:
+                services = self.k8s_client.v1.list_namespaced_service(namespace=namespace)
+
+                for svc in services.items:
+                    # Check if service name matches any pattern
+                    for pattern in service_names:
+                        if pattern in svc.metadata.name.lower():
+                            # Find the right port (usually 9090 or http)
+                            for port in svc.spec.ports:
+                                if port.port == 9090 or port.name in ['http', 'web']:
+                                    return (namespace, svc.metadata.name, port.port)
+            except ApiException:
+                # Namespace might not exist, continue searching
+                continue
+
+        return (None, None, None)
+
     def start_prometheus_port_forward(self) -> bool:
         """
-        Start kubectl port-forward for Prometheus.
+        Start kubectl port-forward for Prometheus with auto-discovery.
 
         Returns:
             True if port-forward started successfully or not needed
@@ -551,13 +1077,25 @@ class ExperimentRunner:
             print("✅ Port 9090 already in use (assuming Prometheus is accessible)")
             return True
 
+        # Auto-discover Prometheus service
+        print("🔍 Auto-discovering Prometheus service...")
+        namespace, service_name, port = self._find_prometheus_service()
+
+        if not service_name:
+            print("⚠️  Prometheus service not found in cluster")
+            print("   Skipping port-forward - you may need to specify --prometheus-url manually")
+            print("   Or ensure Prometheus is installed: helm install prometheus prometheus-community/kube-prometheus-stack")
+            return True  # Continue without port-forward
+
+        print(f"✅ Found Prometheus: {namespace}/{service_name}:{port}")
+
         try:
             # Start port-forward in background
             cmd = [
                 'kubectl', 'port-forward',
-                '-n', 'monitoring',
-                'svc/prometheus-kube-prometheus-prometheus',
-                '9090:9090'
+                '-n', namespace,
+                f'svc/{service_name}',
+                f'9090:{port}'
             ]
 
             print(f"  Starting: {' '.join(cmd)}")
@@ -608,7 +1146,7 @@ class ExperimentRunner:
 
     def deploy_manifest(self) -> bool:
         """
-        Deploy the Kubernetes manifest using kubectl.
+        Deploy the Kubernetes manifest using Kubernetes API.
 
         Returns:
             True if deployment successful, False otherwise
@@ -618,61 +1156,35 @@ class ExperimentRunner:
         print(f"{'='*60}")
 
         try:
-            # Apply the manifest
-            result = subprocess.run(
-                ['kubectl', 'apply', '-f', str(self.manifest_path), '-n', self.namespace],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode != 0:
-                print(f"❌ Failed to deploy manifest: {result.stderr}")
+            # Apply the manifest using K8s API
+            if not self.k8s_client.apply_manifest_from_file(str(self.manifest_path), self.namespace):
+                print(f"❌ Failed to deploy manifest")
                 return False
 
             print(f"✅ Manifest applied successfully")
-            print(result.stdout)
 
-            # Wait for deployments to be ready
-            print("\n⏳ Waiting for pods to be ready...")
-            time.sleep(5)  # Give K8s a moment to create resources
-
-            # Get deployments from manifest and wait for them
+            # Wait for deployments to be ready using Watch API
+            print("\n⏳ Waiting for deployments to be ready...")
             self._wait_for_deployments_ready()
 
             return True
 
-        except subprocess.TimeoutExpired:
-            print("❌ Deployment timed out")
-            return False
         except Exception as e:
             print(f"❌ Error deploying manifest: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _wait_for_deployments_ready(self, timeout: int = 120):
         """
-        Wait for all deployments in namespace to be ready.
+        Wait for all deployments in namespace to be ready using Watch API.
 
         Args:
             timeout: Maximum time to wait in seconds
         """
-        try:
-            result = subprocess.run(
-                ['kubectl', 'wait', '--for=condition=available',
-                 '--timeout={}s'.format(timeout),
-                 'deployment', '--all', '-n', self.namespace],
-                capture_output=True,
-                text=True,
-                timeout=timeout + 10
-            )
-
-            if result.returncode == 0:
-                print("✅ All deployments are ready")
-            else:
-                print(f"⚠️  Warning: Some deployments may not be ready: {result.stderr}")
-
-        except Exception as e:
-            print(f"⚠️  Warning: Could not verify deployment readiness: {e}")
+        success = self.k8s_client.wait_for_deployments_ready(self.namespace, timeout)
+        if not success:
+            print(f"⚠️  Warning: Some deployments may not be ready within {timeout}s")
 
     def run_locust_constant(
         self,
@@ -839,7 +1351,7 @@ class ExperimentRunner:
         print(f"📊 Collecting metrics for {duration}s (interval: {interval}s)")
         print(f"{'='*60}")
 
-        self.collector = PrometheusCollector(self.prometheus_url)
+        self.collector = PrometheusCollector(self.prometheus_url, k8s_client=self.k8s_client)
 
         # Check Prometheus health
         if not self.collector.health_check():
@@ -991,7 +1503,7 @@ class ExperimentRunner:
             print("✅ Locust stopped")
 
     def cleanup_deployment(self):
-        """Delete the deployed Kubernetes resources."""
+        """Delete the deployed Kubernetes resources using Kubernetes API."""
         if not self.cleanup:
             print("\n⏭️  Skipping cleanup (--no-cleanup specified)")
             return
@@ -1001,17 +1513,10 @@ class ExperimentRunner:
         print(f"{'='*60}")
 
         try:
-            result = subprocess.run(
-                ['kubectl', 'delete', '-f', str(self.manifest_path), '-n', self.namespace],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-
-            if result.returncode == 0:
+            if self.k8s_client.delete_manifest_from_file(str(self.manifest_path), self.namespace):
                 print("✅ Deployment cleaned up successfully")
             else:
-                print(f"⚠️  Warning during cleanup: {result.stderr}")
+                print("⚠️  Warning: Some resources may not have been deleted")
 
         except Exception as e:
             print(f"⚠️  Error during cleanup: {e}")
